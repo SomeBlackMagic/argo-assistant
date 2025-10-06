@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"./workloads"
+
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,6 +55,9 @@ type KubeLogStreamer struct {
 
 	// log streamer for formatting output
 	logStreamer *LogStreamer
+
+	// workload manager for handling different workload types
+	workloadManager *workloads.WorkloadManager
 }
 
 func createKubernetesClient() (*kubernetes.Clientset, *rest.Config, error) {
@@ -97,6 +102,9 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		os.Exit(1)
 	}
 
+	// Set logger for workloads package
+	workloads.SetLogger(logger)
+
 	streamer := &KubeLogStreamer{
 		Client:          kubeClient,
 		RestConfig:      kubeConfig,
@@ -107,6 +115,7 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		activeStreams:   make(map[PodContainerKey]struct{}),
 		topLevelUIDs:    make(map[string]struct{}),
 		logStreamer:     NewLogStreamer(kubeClient, namespace, out),
+		workloadManager: workloads.NewWorkloadManager(),
 	}
 
 	logger.Info("KubeLogStreamer successfully created")
@@ -226,145 +235,14 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 		k.scanPodsForWorkloads(ctx)
 	}
 
-	// Deployments
-	logger.Debug("Setting up Deployment watcher")
-	depInf := factory.Apps().V1().Deployments().Informer()
-	depInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("deployment", o.GetNamespace()+"/"+o.GetName()).Debug("Deployment added")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			if o, ok := newObj.(metav1.Object); ok {
-				logger.WithField("deployment", o.GetNamespace()+"/"+o.GetName()).Debug("Deployment updated")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("deployment", o.GetNamespace()+"/"+o.GetName()).Debug("Deployment deleted")
-				delUID(o)
-			}
-		},
-	})
+	handlers := workloads.WorkloadEventHandlers{
+		AddIfMatch: addIfMatch,
+		DelUID:     delUID,
+		Rescan:     rescan,
+	}
 
-	// StatefulSets
-	logger.Debug("Setting up StatefulSet watcher")
-	stsInf := factory.Apps().V1().StatefulSets().Informer()
-	stsInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("statefulset", o.GetNamespace()+"/"+o.GetName()).Debug("StatefulSet added")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			if o, ok := newObj.(metav1.Object); ok {
-				logger.WithField("statefulset", o.GetNamespace()+"/"+o.GetName()).Debug("StatefulSet updated")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("statefulset", o.GetNamespace()+"/"+o.GetName()).Debug("StatefulSet deleted")
-				delUID(o)
-			}
-		},
-	})
-
-	// DaemonSets
-	logger.Debug("Setting up DaemonSet watcher")
-	dsInf := factory.Apps().V1().DaemonSets().Informer()
-	dsInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("daemonset", o.GetNamespace()+"/"+o.GetName()).Debug("DaemonSet added")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			if o, ok := newObj.(metav1.Object); ok {
-				logger.WithField("daemonset", o.GetNamespace()+"/"+o.GetName()).Debug("DaemonSet updated")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("daemonset", o.GetNamespace()+"/"+o.GetName()).Debug("DaemonSet deleted")
-				delUID(o)
-			}
-		},
-	})
-
-	// Jobs
-	logger.Debug("Setting up Job watcher")
-	jobInf := factory.Batch().V1().Jobs().Informer()
-	jobInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("job", o.GetNamespace()+"/"+o.GetName()).Debug("Job added")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			if o, ok := newObj.(metav1.Object); ok {
-				logger.WithField("job", o.GetNamespace()+"/"+o.GetName()).Debug("Job updated")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("job", o.GetNamespace()+"/"+o.GetName()).Debug("Job deleted")
-				delUID(o)
-			}
-		},
-	})
-
-	// CronJobs
-	logger.Debug("Setting up CronJob watcher")
-	cjInf := factory.Batch().V1().CronJobs().Informer()
-	cjInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("cronjob", o.GetNamespace()+"/"+o.GetName()).Debug("CronJob added")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			if o, ok := newObj.(metav1.Object); ok {
-				logger.WithField("cronjob", o.GetNamespace()+"/"+o.GetName()).Debug("CronJob updated")
-				if addIfMatch(o) {
-					rescan()
-				}
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			if o, ok := obj.(metav1.Object); ok {
-				logger.WithField("cronjob", o.GetNamespace()+"/"+o.GetName()).Debug("CronJob deleted")
-				delUID(o)
-			}
-		},
-	})
+	// Setup all workload informers using the workload manager
+	k.workloadManager.SetupAllInformers(factory, handlers)
 }
 
 // scanExistingWorkloads - ищет существующие workload'ы с нужным tracking-id и их поды
