@@ -2,15 +2,13 @@
 package main
 
 import (
+	"argocd-watcher/workloads"
 	"context"
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"time"
-
-	"./workloads"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -19,7 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	rest "k8s.io/client-go/rest"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -47,17 +45,14 @@ type KubeLogStreamer struct {
 	activeStreams map[PodContainerKey]struct{}
 
 	ownerCacheMu sync.Mutex
-	topLevelUIDs map[string]struct{} // UID'ы топовых ворклоадов (Deployment/StatefulSet/DaemonSet/Job/CronJob)
+	topLevelUIDs map[string]struct{} // UIDs of top-level workloads (Deployment/StatefulSet/DaemonSet/Job/CronJob)
 
-	// для повторного сканирования подов при появлении новых ворклоадов
+	// for rescanning pods when new workloads appear
 	podListerOnce sync.Once
 	podListerFunc func() ([]*corev1.Pod, error)
 
 	// log streamer for formatting output
 	logStreamer *LogStreamer
-
-	// workload manager for handling different workload types
-	workloadManager *workloads.WorkloadManager
 }
 
 func createKubernetesClient() (*kubernetes.Clientset, *rest.Config, error) {
@@ -115,22 +110,21 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		activeStreams:   make(map[PodContainerKey]struct{}),
 		topLevelUIDs:    make(map[string]struct{}),
 		logStreamer:     NewLogStreamer(kubeClient, namespace, out),
-		workloadManager: workloads.NewWorkloadManager(),
 	}
 
 	logger.Info("KubeLogStreamer successfully created")
 	return streamer
 }
 
-// StreamLogsByTrackingID: поднимает информеры по ворклоадам (ожидание появления) и по подам,
-// затем работает, пока не остановят контекст.
+// StreamLogsByTrackingID: sets up informers for workloads (waiting for them to appear) and for pods,
+// then works until the context is cancelled.
 func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	logger.WithFields(logrus.Fields{
 		"namespace":  k.Namespace,
 		"trackingID": k.TrackingID,
 	}).Info("Starting log streaming")
 
-	// Общая фабрика с ограничением по namespace
+	// Shared factory with namespace restriction
 	logger.Debug("Creating shared informer factory")
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		k.Client,
@@ -138,11 +132,11 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 		informers.WithNamespace(k.Namespace),
 	)
 
-	// Под-информер
+	// Pod informer
 	logger.Debug("Setting up pod informer")
 	podInf := factory.Core().V1().Pods().Informer()
 
-	// Ленивая обёртка для листинга подов (используется при появлении новых ворклоадов)
+	// Lazy wrapper for listing pods (used when new workloads appear)
 	k.podListerOnce.Do(func() {
 		logger.Debug("Initializing pod lister function")
 		lister := factory.Core().V1().Pods().Lister()
@@ -151,14 +145,14 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 		}
 	})
 
-	// Обработка событий по подам
+	// Processing pod events
 	logger.Debug("Adding pod event handlers")
 	podInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { k.onPodEvent(ctx, obj) },
 		UpdateFunc: func(_, newObj interface{}) { k.onPodEvent(ctx, newObj) },
 	})
 
-	// Поднимаем вотчеры по ворклоадам и подписываемся на их изменения
+	// Start watchers for workloads and subscribe to their changes
 	logger.Debug("Starting workload watchers")
 	k.startWorkloadWatchers(ctx, factory)
 
@@ -171,14 +165,14 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	logger.Info("Waiting for cache sync...")
 	if !cache.WaitForCacheSync(ctx.Done(),
 		podInf.HasSynced,
-		// Синк всех нужных кэшей произойдёт внутри startWorkloadWatchers через ту же фабрику
+		// Sync of all needed caches will happen inside startWorkloadWatchers through the same factory
 	) {
 		logger.Error("Cache sync failed")
 		return fmt.Errorf("cache not synced")
 	}
 	logger.Info("Cache sync completed successfully")
 
-	// После первичного синка — найдем существующие workload'ы и их поды
+	// After initial sync - find existing workloads and their pods
 	logger.Debug("Scanning existing workloads")
 	k.scanExistingWorkloads(ctx, factory)
 
@@ -188,36 +182,27 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// Поднимает обработчики на Deployments/StatefulSets/DaemonSets/Jobs/CronJobs.
-// При появлении/обновлении объектов с целевым tracking-id — добавляет их UID в топ-набор и пересканывает поды.
+// Sets up handlers for Deployments/StatefulSets/DaemonSets/Jobs/CronJobs.
+// When objects with target tracking-id appear/update - adds their UID to the top-level set and rescans pods.
 func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory informers.SharedInformerFactory) {
-	match := k.makeTrackingMatcher()
-
 	addIfMatch := func(obj metav1.Object) bool {
-		annotations := obj.GetAnnotations()
-		if annotations == nil {
-			return false
-		}
-		if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
+		logger.WithFields(logrus.Fields{
+			"workload":    obj.GetNamespace() + "/" + obj.GetName(),
+			"tracking-id": obj.GetAnnotations()[trackingAnnotationKey],
+		}).Info("Found matching workload")
+
+		k.ownerCacheMu.Lock()
+		_, existed := k.topLevelUIDs[string(obj.GetUID())]
+		k.topLevelUIDs[string(obj.GetUID())] = struct{}{}
+		k.ownerCacheMu.Unlock()
+
+		if !existed {
 			logger.WithFields(logrus.Fields{
-				"workload":    obj.GetNamespace() + "/" + obj.GetName(),
-				"tracking-id": v,
-			}).Info("Found matching workload")
-
-			k.ownerCacheMu.Lock()
-			_, existed := k.topLevelUIDs[string(obj.GetUID())]
-			k.topLevelUIDs[string(obj.GetUID())] = struct{}{}
-			k.ownerCacheMu.Unlock()
-
-			if !existed {
-				logger.WithFields(logrus.Fields{
-					"uid":      string(obj.GetUID()),
-					"workload": obj.GetNamespace() + "/" + obj.GetName(),
-				}).Debug("Added new top-level UID for workload")
-			}
-			return !existed
+				"uid":      string(obj.GetUID()),
+				"workload": obj.GetNamespace() + "/" + obj.GetName(),
+			}).Debug("Added new top-level UID for workload")
 		}
-		return false
+		return !existed
 	}
 	delUID := func(obj metav1.Object) {
 		logger.WithFields(logrus.Fields{
@@ -230,140 +215,34 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 	}
 
 	rescan := func() {
-		// Перескан подов при появлении нового ворклоада - ищем только поды принадлежащие нашим workload'ам
+		// Rescan pods when new workload appears - look for pods belonging to our workloads only
 		logger.Debug("Rescanning pods due to new workload discovery")
 		k.scanPodsForWorkloads(ctx)
 	}
 
-	handlers := workloads.WorkloadEventHandlers{
-		AddIfMatch: addIfMatch,
-		DelUID:     delUID,
-		Rescan:     rescan,
-	}
-
-	// Setup all workload informers using the workload manager
-	k.workloadManager.SetupAllInformers(factory, handlers)
+	// Setup all workload watchers using workloads package
+	workloads.SetupAllWorkloadWatchers(factory, k.Namespace, k.TrackingID, k.TrackingIDExact, addIfMatch, delUID, rescan)
 }
 
-// scanExistingWorkloads - ищет существующие workload'ы с нужным tracking-id и их поды
+// scanExistingWorkloads - finds existing workloads with needed tracking-id and their pods
 func (k *KubeLogStreamer) scanExistingWorkloads(ctx context.Context, factory informers.SharedInformerFactory) {
-	match := k.makeTrackingMatcher()
-	var foundWorkloads []metav1.Object
-
-	// Проверяем Deployments
-	deployments, err := factory.Apps().V1().Deployments().Lister().Deployments(k.Namespace).List(labels.Everything())
-	if err != nil {
-		logger.WithError(err).Warning("Failed to list existing deployments")
-	} else {
-		for _, dep := range deployments {
-			if annotations := dep.GetAnnotations(); annotations != nil {
-				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
-					logger.WithFields(logrus.Fields{
-						"deployment":  dep.GetNamespace() + "/" + dep.GetName(),
-						"tracking-id": v,
-					}).Info("Found existing matching deployment")
-					k.ownerCacheMu.Lock()
-					k.topLevelUIDs[string(dep.GetUID())] = struct{}{}
-					k.ownerCacheMu.Unlock()
-					foundWorkloads = append(foundWorkloads, dep)
-				}
-			}
-		}
+	addToCache := func(uid string) {
+		k.ownerCacheMu.Lock()
+		k.topLevelUIDs[uid] = struct{}{}
+		k.ownerCacheMu.Unlock()
 	}
 
-	// Проверяем StatefulSets
-	statefulsets, err := factory.Apps().V1().StatefulSets().Lister().StatefulSets(k.Namespace).List(labels.Everything())
-	if err != nil {
-		logger.WithError(err).Warning("Failed to list existing statefulsets")
-	} else {
-		for _, sts := range statefulsets {
-			if annotations := sts.GetAnnotations(); annotations != nil {
-				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
-					logger.WithFields(logrus.Fields{
-						"statefulset": sts.GetNamespace() + "/" + sts.GetName(),
-						"tracking-id": v,
-					}).Info("Found existing matching statefulset")
-					k.ownerCacheMu.Lock()
-					k.topLevelUIDs[string(sts.GetUID())] = struct{}{}
-					k.ownerCacheMu.Unlock()
-					foundWorkloads = append(foundWorkloads, sts)
-				}
-			}
-		}
-	}
-
-	// Проверяем DaemonSets
-	daemonsets, err := factory.Apps().V1().DaemonSets().Lister().DaemonSets(k.Namespace).List(labels.Everything())
-	if err != nil {
-		logger.WithError(err).Warning("Failed to list existing daemonsets")
-	} else {
-		for _, ds := range daemonsets {
-			if annotations := ds.GetAnnotations(); annotations != nil {
-				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
-					logger.WithFields(logrus.Fields{
-						"daemonset":   ds.GetNamespace() + "/" + ds.GetName(),
-						"tracking-id": v,
-					}).Info("Found existing matching daemonset")
-					k.ownerCacheMu.Lock()
-					k.topLevelUIDs[string(ds.GetUID())] = struct{}{}
-					k.ownerCacheMu.Unlock()
-					foundWorkloads = append(foundWorkloads, ds)
-				}
-			}
-		}
-	}
-
-	// Проверяем Jobs
-	jobs, err := factory.Batch().V1().Jobs().Lister().Jobs(k.Namespace).List(labels.Everything())
-	if err != nil {
-		logger.WithError(err).Warning("Failed to list existing jobs")
-	} else {
-		for _, job := range jobs {
-			if annotations := job.GetAnnotations(); annotations != nil {
-				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
-					logger.WithFields(logrus.Fields{
-						"job":         job.GetNamespace() + "/" + job.GetName(),
-						"tracking-id": v,
-					}).Info("Found existing matching job")
-					k.ownerCacheMu.Lock()
-					k.topLevelUIDs[string(job.GetUID())] = struct{}{}
-					k.ownerCacheMu.Unlock()
-					foundWorkloads = append(foundWorkloads, job)
-				}
-			}
-		}
-	}
-
-	// Проверяем CronJobs
-	cronjobs, err := factory.Batch().V1().CronJobs().Lister().CronJobs(k.Namespace).List(labels.Everything())
-	if err != nil {
-		logger.WithError(err).Warning("Failed to list existing cronjobs")
-	} else {
-		for _, cj := range cronjobs {
-			if annotations := cj.GetAnnotations(); annotations != nil {
-				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
-					logger.WithFields(logrus.Fields{
-						"cronjob":     cj.GetNamespace() + "/" + cj.GetName(),
-						"tracking-id": v,
-					}).Info("Found existing matching cronjob")
-					k.ownerCacheMu.Lock()
-					k.topLevelUIDs[string(cj.GetUID())] = struct{}{}
-					k.ownerCacheMu.Unlock()
-					foundWorkloads = append(foundWorkloads, cj)
-				}
-			}
-		}
-	}
+	foundWorkloads := workloads.ScanAllExistingWorkloads(factory, k.Namespace, k.TrackingID, k.TrackingIDExact, addToCache)
 
 	logger.WithField("count", len(foundWorkloads)).Info("Found existing matching workloads")
 
-	// Теперь найдем поды для этих workload'ов
+	// Now find pods for these workloads
 	if len(foundWorkloads) > 0 {
 		k.scanPodsForWorkloads(ctx)
 	}
 }
 
-// scanPodsForWorkloads - находит поды принадлежащие найденным workload'ам
+// scanPodsForWorkloads - finds pods belonging to found workloads
 func (k *KubeLogStreamer) scanPodsForWorkloads(ctx context.Context) {
 	logger.Debug("Scanning pods for found workloads")
 	if k.podListerFunc == nil {
@@ -391,7 +270,7 @@ func (k *KubeLogStreamer) scanPodsForWorkloads(ctx context.Context) {
 	}).Info("Completed pod scan for workloads")
 }
 
-// onPodEvent — обёртка
+// onPodEvent - wrapper function
 func (k *KubeLogStreamer) onPodEvent(ctx context.Context, obj interface{}) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -402,12 +281,12 @@ func (k *KubeLogStreamer) onPodEvent(ctx context.Context, obj interface{}) {
 	k.onPod(ctx, pod)
 }
 
-// onPod — фильтрует pod по владельцам и стартует логи для всех контейнеров
+// onPod - filters pod by owners and starts logs for all containers
 func (k *KubeLogStreamer) onPod(ctx context.Context, pod *corev1.Pod) {
 	k.onPodWithExistingFlag(ctx, pod, false)
 }
 
-// onPodWithExistingFlag — внутренняя функция для обработки подов с флагом существующего пода
+// onPodWithExistingFlag - internal function for processing pods with existing pod flag
 func (k *KubeLogStreamer) onPodWithExistingFlag(ctx context.Context, pod *corev1.Pod, isExistingPod bool) {
 	if pod.Namespace != k.Namespace {
 		logger.WithFields(logrus.Fields{
@@ -417,7 +296,7 @@ func (k *KubeLogStreamer) onPodWithExistingFlag(ctx context.Context, pod *corev1
 		return
 	}
 
-	// Проверяем принадлежность к нашим top-level ворклоадам
+	// Check if belongs to our top-level workloads
 	if !k.podBelongsToTargets(ctx, pod) {
 		logger.WithField("pod", pod.Name).Debug("Pod does not belong to target workloads, skipping")
 		return
@@ -436,7 +315,7 @@ func (k *KubeLogStreamer) onPodWithExistingFlag(ctx context.Context, pod *corev1
 		key := PodContainerKey{PodName: pod.Name, Namespace: pod.Namespace, ContainerName: cs.Name, RestartCount: cs.RestartCount}
 		k.maybeStartLogStream(ctx, pod, cs.Name, key, isExistingPod)
 	}
-	// обычные контейнеры
+	// regular containers
 	for _, cs := range pod.Status.ContainerStatuses {
 		logger.WithFields(logrus.Fields{
 			"pod":       pod.Name,
@@ -484,9 +363,9 @@ func (k *KubeLogStreamer) maybeStartLogStream(ctx context.Context, pod *corev1.P
 	}()
 }
 
-// поднимаемся по ownerReferences до top-level и проверяем вхождение в k.topLevelUIDs
+// traverse ownerReferences up to top-level and check inclusion in k.topLevelUIDs
 func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.Pod) bool {
-	logger.WithField("pod", pod.Name).Debug("Checking ownership chain")
+	//logger.WithField("pod", pod.Name).Debug("Checking ownership chain")
 
 	visited := map[string]bool{}
 	var (
@@ -546,8 +425,24 @@ func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.P
 
 		switch owner.Kind {
 		case "ReplicaSet":
+			// Check if context is already cancelled before making API call
+			select {
+			case <-ctx.Done():
+				logger.WithField("replicaset", ns+"/"+owner.Name).Debug("Context cancelled, skipping ReplicaSet lookup")
+				return false
+			default:
+			}
+
 			rs, err := k.Client.AppsV1().ReplicaSets(ns).Get(ctx, owner.Name, metav1.GetOptions{})
 			if err != nil {
+				// Check for specific error types
+				if ctx.Err() != nil {
+					logger.WithFields(logrus.Fields{
+						"replicaset":  ns + "/" + owner.Name,
+						"context_err": ctx.Err().Error(),
+					}).Debug("Context cancelled during ReplicaSet lookup")
+					return false
+				}
 				logger.WithField("replicaset", ns+"/"+owner.Name).WithError(err).Warning("Failed to get ReplicaSet")
 				return false
 			}
@@ -565,8 +460,24 @@ func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.P
 			}
 			continue
 		case "StatefulSet":
+			// Check if context is already cancelled before making API call
+			select {
+			case <-ctx.Done():
+				logger.WithField("statefulset", ns+"/"+owner.Name).Debug("Context cancelled, skipping StatefulSet lookup")
+				return false
+			default:
+			}
+
 			ss, err := k.Client.AppsV1().StatefulSets(ns).Get(ctx, owner.Name, metav1.GetOptions{})
 			if err != nil {
+				// Check for specific error types
+				if ctx.Err() != nil {
+					logger.WithFields(logrus.Fields{
+						"statefulset": ns + "/" + owner.Name,
+						"context_err": ctx.Err().Error(),
+					}).Debug("Context cancelled during StatefulSet lookup")
+					return false
+				}
 				logger.WithField("statefulset", ns+"/"+owner.Name).WithError(err).Warning("Failed to get StatefulSet")
 				return false
 			}
@@ -577,8 +488,24 @@ func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.P
 			}).Debug("Checked StatefulSet target status")
 			return result
 		case "DaemonSet":
+			// Check if context is already cancelled before making API call
+			select {
+			case <-ctx.Done():
+				logger.WithField("daemonset", ns+"/"+owner.Name).Debug("Context cancelled, skipping DaemonSet lookup")
+				return false
+			default:
+			}
+
 			ds, err := k.Client.AppsV1().DaemonSets(ns).Get(ctx, owner.Name, metav1.GetOptions{})
 			if err != nil {
+				// Check for specific error types
+				if ctx.Err() != nil {
+					logger.WithFields(logrus.Fields{
+						"daemonset":   ns + "/" + owner.Name,
+						"context_err": ctx.Err().Error(),
+					}).Debug("Context cancelled during DaemonSet lookup")
+					return false
+				}
 				logger.WithField("daemonset", ns+"/"+owner.Name).WithError(err).Warning("Failed to get DaemonSet")
 				return false
 			}
@@ -589,8 +516,24 @@ func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.P
 			}).Debug("Checked DaemonSet target status")
 			return result
 		case "Job":
+			// Check if context is already cancelled before making API call
+			select {
+			case <-ctx.Done():
+				logger.WithField("job", ns+"/"+owner.Name).Debug("Context cancelled, skipping Job lookup")
+				return false
+			default:
+			}
+
 			job, err := k.Client.BatchV1().Jobs(ns).Get(ctx, owner.Name, metav1.GetOptions{})
 			if err != nil {
+				// Check for specific error types
+				if ctx.Err() != nil {
+					logger.WithFields(logrus.Fields{
+						"job":         ns + "/" + owner.Name,
+						"context_err": ctx.Err().Error(),
+					}).Debug("Context cancelled during Job lookup")
+					return false
+				}
 				logger.WithField("job", ns+"/"+owner.Name).WithError(err).Warning("Failed to get Job")
 				return false
 			}
@@ -609,8 +552,24 @@ func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.P
 			}).Debug("Checked Job target status")
 			return result
 		case "Deployment":
+			// Check if context is already cancelled before making API call
+			select {
+			case <-ctx.Done():
+				logger.WithField("deployment", ns+"/"+owner.Name).Debug("Context cancelled, skipping Deployment lookup")
+				return false
+			default:
+			}
+
 			dep, err := k.Client.AppsV1().Deployments(ns).Get(ctx, owner.Name, metav1.GetOptions{})
 			if err != nil {
+				// Check for specific error types
+				if ctx.Err() != nil {
+					logger.WithFields(logrus.Fields{
+						"deployment":  ns + "/" + owner.Name,
+						"context_err": ctx.Err().Error(),
+					}).Debug("Context cancelled during Deployment lookup")
+					return false
+				}
 				logger.WithField("deployment", ns+"/"+owner.Name).WithError(err).Warning("Failed to get Deployment")
 				return false
 			}
@@ -621,8 +580,24 @@ func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.P
 			}).Debug("Checked Deployment target status")
 			return result
 		case "CronJob":
+			// Check if context is already cancelled before making API call
+			select {
+			case <-ctx.Done():
+				logger.WithField("cronjob", ns+"/"+owner.Name).Debug("Context cancelled, skipping CronJob lookup")
+				return false
+			default:
+			}
+
 			cj, err := k.Client.BatchV1().CronJobs(ns).Get(ctx, owner.Name, metav1.GetOptions{})
 			if err != nil {
+				// Check for specific error types
+				if ctx.Err() != nil {
+					logger.WithFields(logrus.Fields{
+						"cronjob":     ns + "/" + owner.Name,
+						"context_err": ctx.Err().Error(),
+					}).Debug("Context cancelled during CronJob lookup")
+					return false
+				}
 				logger.WithField("cronjob", ns+"/"+owner.Name).WithError(err).Warning("Failed to get CronJob")
 				return false
 			}
@@ -674,57 +649,4 @@ func getOwnerRefs(kind, ns, name string, pod *corev1.Pod) []metav1.OwnerReferenc
 		return pod.OwnerReferences
 	}
 	return nil
-}
-
-// makeTrackingMatcher — точное совпадение или "содержит" namespace и имя приложения
-func (k *KubeLogStreamer) makeTrackingMatcher() func(string) bool {
-	appName := k.TrackingID
-	ns := k.Namespace
-
-	if k.TrackingIDExact {
-		want := fmt.Sprintf("%s_%s:apps/Deployment:%s/%s", ns, appName, ns, appName)
-		logger.WithField("tracking_id", want).Debug("Using exact matching for tracking ID")
-		return func(got string) bool {
-			match := got == want
-			if match {
-				logger.WithField("tracking_id", got).Debug("Exact match found")
-			}
-			return match
-		}
-	}
-
-	// Формируем ожидаемые части tracking-id в формате: namespace_app-name:apps/Kind:namespace/app-name
-	expectedPrefix := fmt.Sprintf("%s_%s:", ns, appName)
-	expectedSuffix := fmt.Sprintf(":%s/%s", ns, appName)
-
-	logger.WithFields(logrus.Fields{
-		"app_name":        appName,
-		"namespace":       ns,
-		"expected_prefix": expectedPrefix,
-		"expected_suffix": expectedSuffix,
-	}).Debug("Using partial matching for tracking ID")
-
-	return func(got string) bool {
-		// Проверяем что tracking-id содержит префикс namespace_app-name: и суффикс :namespace/app-name
-		if !strings.HasPrefix(got, expectedPrefix) {
-			logger.WithFields(logrus.Fields{
-				"tracking_id":     got,
-				"expected_prefix": expectedPrefix,
-			}).Debug("Tracking ID does not have expected prefix")
-			return false
-		}
-		if !strings.HasSuffix(got, expectedSuffix) {
-			logger.WithFields(logrus.Fields{
-				"tracking_id":     got,
-				"expected_suffix": expectedSuffix,
-			}).Debug("Tracking ID does not have expected suffix")
-			return false
-		}
-		logger.WithFields(logrus.Fields{
-			"tracking_id":     got,
-			"expected_prefix": expectedPrefix,
-			"expected_suffix": expectedSuffix,
-		}).Debug("Tracking ID matches expected pattern")
-		return true
-	}
 }

@@ -38,8 +38,6 @@ func init() {
 	default:
 		logger.SetLevel(logrus.InfoLevel)
 	}
-
-	logger.WithField("level", logger.GetLevel().String()).Info("Logger initialized")
 }
 
 // LogStreamer handles the actual streaming and formatting of container logs
@@ -60,7 +58,6 @@ func NewLogStreamer(client *kubernetes.Clientset, namespace string, out io.Write
 // StartLogStream starts streaming logs for a specific pod/container
 func (ls *LogStreamer) StartLogStream(ctx context.Context, podName, containerName string, isExistingPod bool) error {
 	streamKey := podName + "/" + containerName
-	logger.WithField("stream", streamKey).Debug("Starting log stream")
 
 	// Wait for container to be ready
 	ls.waitContainerReady(ctx, podName, containerName)
@@ -80,7 +77,6 @@ func (ls *LogStreamer) StartLogStream(ctx context.Context, podName, containerNam
 		fmt.Fprintf(ls.out, "[kubectl] logs --namespace=%s pod/%s -c %s (follow)\n", ls.namespace, podName, containerName)
 	}
 
-	logger.WithField("stream", streamKey).Debug("Creating log stream request")
 	req := ls.client.CoreV1().Pods(ls.namespace).GetLogs(podName, logOptions)
 	stream, err := req.Stream(ctx)
 	if err != nil {
@@ -89,33 +85,26 @@ func (ls *LogStreamer) StartLogStream(ctx context.Context, podName, containerNam
 	}
 	defer stream.Close()
 
-	logger.WithField("stream", streamKey).Info("Log stream established, copying logs")
 	prefix := fmt.Sprintf("[%s %s] ", podName, containerName)
 	if err := copyWithPrefix(ctx, ls.out, stream, prefix); err != nil && err != context.Canceled {
 		logger.WithField("stream", streamKey).WithError(err).Warning("Error copying logs")
 		fmt.Fprintf(ls.out, "[warn] copy logs error pod=%s container=%s: %v\n", podName, containerName, err)
 		return err
-	} else {
-		logger.WithField("stream", streamKey).Info("Log stream ended normally")
 	}
 	return nil
 }
 
 func (ls *LogStreamer) waitContainerReady(ctx context.Context, podName, container string) {
 	streamKey := podName + "/" + container
-	logger.WithField("stream", streamKey).Debug("Waiting for container to be ready")
 
 	t := time.NewTicker(700 * time.Millisecond)
 	defer t.Stop()
 
-	checkCount := 0
 	for {
 		select {
 		case <-ctx.Done():
-			logger.WithField("stream", streamKey).Debug("Context cancelled while waiting for container")
 			return
 		case <-t.C:
-			checkCount++
 			pod, err := ls.client.CoreV1().Pods(ls.namespace).Get(ctx, podName, metav1.GetOptions{})
 			if err != nil {
 				logger.WithField("stream", streamKey).WithError(err).Warning("Failed to get pod while waiting for container")
@@ -125,17 +114,7 @@ func (ls *LogStreamer) waitContainerReady(ctx context.Context, podName, containe
 			for _, cs := range append(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses...) {
 				if cs.Name == container {
 					if cs.ContainerID != "" {
-						logger.WithFields(logrus.Fields{
-							"stream":       streamKey,
-							"container_id": cs.ContainerID,
-						}).Debug("Container is ready")
 						return
-					}
-					if checkCount%10 == 0 { // Log every 7 seconds
-						logger.WithFields(logrus.Fields{
-							"stream": streamKey,
-							"state":  fmt.Sprintf("%+v", cs.State),
-						}).Debug("Container still not ready")
 					}
 					break
 				}

@@ -19,7 +19,7 @@ func main() {
 	appName := os.Args[1]
 	namespace := os.Args[2]
 
-	// Контекст с отменой и обработка сигналов
+	// Context with cancellation and signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 2)
@@ -29,7 +29,7 @@ func main() {
 		cancel()
 	}()
 
-	// Параллельно — стрим логов, передаем app-name для отслеживания по tracking-id аннотации
+	// In parallel - log streaming, pass app-name for tracking via tracking-id annotation
 	var wg sync.WaitGroup
 	logCtx, logCancel := context.WithCancel(ctx)
 	wg.Add(1)
@@ -37,14 +37,14 @@ func main() {
 		defer wg.Done()
 		streamer := NewKubeLogStreamer(namespace, appName, false, os.Stdout)
 		if err := streamer.StreamLogsByTrackingID(logCtx); err != nil && err != context.Canceled {
-			fmt.Fprintf(os.Stderr, "Ошибка стрима логов: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Log streaming error: %v\n", err)
 		}
 	}()
 
-	// Основной подпроцесс: argocd app wait ...
+	// Main subprocess: argocd app wait ...
 	exitCode := RunArgoWait(ctx, argocd, appName, namespace)
 
-	// Завершение лог-стримера
+	// Stop log streamer
 	logCancel()
 	wg.Wait()
 
@@ -57,7 +57,7 @@ func getEnvStrict(name, defaultVal string) string {
 		if defaultVal != "" {
 			return defaultVal
 		}
-		fmt.Fprintf(os.Stderr, "Не задана обязательная переменная окружения %s\n", name)
+		fmt.Fprintf(os.Stderr, "Required environment variable %s is not set\n", name)
 		os.Exit(1)
 	}
 	return v

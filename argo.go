@@ -10,9 +10,9 @@ import (
 	"sync"
 )
 
-// getOutputPrefix определяет префикс для строки вывода на основе её содержания
+// getOutputPrefix determines the prefix for an output line based on its content
 func getOutputPrefix(line string) string {
-	// Проверяем на события и логи Kubernetes
+	// Check for Kubernetes events and logs
 	kubeIndicators := []string{
 		"Event:",
 		"Events:",
@@ -47,33 +47,33 @@ func getOutputPrefix(line string) string {
 		}
 	}
 
-	// По умолчанию все остальное считаем выводом ArgoCD
+	// By default, consider everything else as ArgoCD output
 	return "[argo]"
 }
 
-// RunArgoWait запускает `argocd app wait <app> --app-namespace=<ns>`,
-// пробрасывает stdout/stderr и возвращает код выхода подпроцесса.
-// В подпроцесс пробрасываются все переменные окружения с префиксом "ARGO".
+// RunArgoWait runs `argocd app wait <app> --app-namespace=<ns>`,
+// passes stdout/stderr through and returns subprocess exit code.
+// Only environment variables with "ARGO" prefix are passed to subprocess.
 func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int {
 	args := []string{"app", "wait", appName, "--app-namespace=" + namespace, "--health", "--sync", "--grpc-web"}
 	fmt.Fprintln(os.Stderr, "[exec]", argocdBin, strings.Join(args, " "))
 
 	cmd := exec.CommandContext(ctx, argocdBin, args...)
 
-	// Получаем pipes для stdout и stderr
+	// Get pipes for stdout and stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Ошибка создания stdout pipe: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
 		return 1
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Ошибка создания stderr pipe: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating stderr pipe: %v\n", err)
 		return 1
 	}
 
-	// Пробрасываем окружение: только ARGO_*
+	// Pass environment: only ARGO_*
 	var argoEnv []string
 	for _, kv := range os.Environ() {
 		if strings.HasPrefix(kv, "ARGO") {
@@ -86,15 +86,15 @@ func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int 
 	}
 	cmd.Env = argoEnv
 
-	// Запускаем команду
+	// Start the command
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Ошибка запуска команды: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error starting command: %v\n", err)
 		return 1
 	}
 
 	var wg sync.WaitGroup
 
-	// Обрабатываем stdout
+	// Process stdout
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -106,7 +106,7 @@ func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int 
 		}
 	}()
 
-	// Обрабатываем stderr
+	// Process stderr
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -118,7 +118,7 @@ func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int 
 		}
 	}()
 
-	// Ждем завершения обработки всех потоков
+	// Wait for all streams to complete processing
 	wg.Wait()
 
 	err = cmd.Wait()
@@ -128,6 +128,6 @@ func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int 
 	if ee, ok := err.(*exec.ExitError); ok {
 		return ee.ExitCode()
 	}
-	fmt.Fprintln(os.Stderr, "Ошибка запуска argocd:", err)
+	fmt.Fprintln(os.Stderr, "Error starting argocd:", err)
 	return 1
 }
