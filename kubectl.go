@@ -24,33 +24,6 @@ import (
 
 const trackingAnnotationKey = "argocd.argoproj.io/tracking-id"
 
-var logger = logrus.New()
-
-func init() {
-	// Configure logrus
-	logger.SetFormatter(&logrus.TextFormatter{
-		FullTimestamp:   true,
-		TimestampFormat: "2006-01-02 15:04:05",
-	})
-
-	// Set log level from environment variable or default to Info
-	level := os.Getenv("LOG_LEVEL")
-	switch strings.ToLower(level) {
-	case "debug":
-		logger.SetLevel(logrus.DebugLevel)
-	case "info":
-		logger.SetLevel(logrus.InfoLevel)
-	case "warning", "warn":
-		logger.SetLevel(logrus.WarnLevel)
-	case "error":
-		logger.SetLevel(logrus.ErrorLevel)
-	default:
-		logger.SetLevel(logrus.InfoLevel)
-	}
-
-	logger.WithField("level", logger.GetLevel().String()).Info("Logger initialized")
-}
-
 type PodContainerKey struct {
 	PodName       string
 	Namespace     string
@@ -77,6 +50,9 @@ type KubeLogStreamer struct {
 	// для повторного сканирования подов при появлении новых ворклоадов
 	podListerOnce sync.Once
 	podListerFunc func() ([]*corev1.Pod, error)
+
+	// log streamer for formatting output
+	logStreamer *LogStreamer
 }
 
 func createKubernetesClient() (*kubernetes.Clientset, *rest.Config, error) {
@@ -113,11 +89,7 @@ func createKubernetesClient() (*kubernetes.Clientset, *rest.Config, error) {
 }
 
 func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer) *KubeLogStreamer {
-	logger.WithFields(logrus.Fields{
-		"namespace":  namespace,
-		"trackingID": trackingID,
-		"exact":      exact,
-	}).Info("Creating KubeLogStreamer")
+	logger.Info("Creating KubeLogStreamer")
 
 	kubeClient, kubeConfig, err := createKubernetesClient()
 	if err != nil {
@@ -134,6 +106,7 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		Out:             out,
 		activeStreams:   make(map[PodContainerKey]struct{}),
 		topLevelUIDs:    make(map[string]struct{}),
+		logStreamer:     NewLogStreamer(kubeClient, namespace, out),
 	}
 
 	logger.Info("KubeLogStreamer successfully created")
@@ -196,16 +169,9 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	}
 	logger.Info("Cache sync completed successfully")
 
-	// После первичного синка — сразу просканируем уже существующие поды
-	logger.Debug("Scanning existing pods")
-	if pods, err := k.podListerFunc(); err == nil {
-		logger.WithField("count", len(pods)).Info("Found existing pods to process")
-		for _, p := range pods {
-			k.onPodWithExistingFlag(ctx, p, true)
-		}
-	} else {
-		logger.WithError(err).Warning("Failed to list existing pods")
-	}
+	// После первичного синка — найдем существующие workload'ы и их поды
+	logger.Debug("Scanning existing workloads")
+	k.scanExistingWorkloads(ctx, factory)
 
 	logger.Info("Log streaming active, waiting for context cancellation")
 	<-ctx.Done()
@@ -255,22 +221,9 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 	}
 
 	rescan := func() {
-		// Перескан подов при появлении нового таргета
+		// Перескан подов при появлении нового ворклоада - ищем только поды принадлежащие нашим workload'ам
 		logger.Debug("Rescanning pods due to new workload discovery")
-		if k.podListerFunc == nil {
-			logger.Warning("Pod lister not ready, skipping rescan")
-			return
-		}
-		pods, err := k.podListerFunc()
-		if err != nil {
-			logger.WithError(err).Warning("Failed to list pods during rescan")
-			return
-		}
-		logger.WithField("count", len(pods)).Debug("Rescanning pods")
-		for _, p := range pods {
-			k.onPodWithExistingFlag(ctx, p, true)
-		}
-		logger.Debug("Pod rescan completed")
+		k.scanPodsForWorkloads(ctx)
 	}
 
 	// Deployments
@@ -414,6 +367,152 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 	})
 }
 
+// scanExistingWorkloads - ищет существующие workload'ы с нужным tracking-id и их поды
+func (k *KubeLogStreamer) scanExistingWorkloads(ctx context.Context, factory informers.SharedInformerFactory) {
+	match := k.makeTrackingMatcher()
+	var foundWorkloads []metav1.Object
+
+	// Проверяем Deployments
+	deployments, err := factory.Apps().V1().Deployments().Lister().Deployments(k.Namespace).List(labels.Everything())
+	if err != nil {
+		logger.WithError(err).Warning("Failed to list existing deployments")
+	} else {
+		for _, dep := range deployments {
+			if annotations := dep.GetAnnotations(); annotations != nil {
+				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
+					logger.WithFields(logrus.Fields{
+						"deployment":  dep.GetNamespace() + "/" + dep.GetName(),
+						"tracking-id": v,
+					}).Info("Found existing matching deployment")
+					k.ownerCacheMu.Lock()
+					k.topLevelUIDs[string(dep.GetUID())] = struct{}{}
+					k.ownerCacheMu.Unlock()
+					foundWorkloads = append(foundWorkloads, dep)
+				}
+			}
+		}
+	}
+
+	// Проверяем StatefulSets
+	statefulsets, err := factory.Apps().V1().StatefulSets().Lister().StatefulSets(k.Namespace).List(labels.Everything())
+	if err != nil {
+		logger.WithError(err).Warning("Failed to list existing statefulsets")
+	} else {
+		for _, sts := range statefulsets {
+			if annotations := sts.GetAnnotations(); annotations != nil {
+				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
+					logger.WithFields(logrus.Fields{
+						"statefulset": sts.GetNamespace() + "/" + sts.GetName(),
+						"tracking-id": v,
+					}).Info("Found existing matching statefulset")
+					k.ownerCacheMu.Lock()
+					k.topLevelUIDs[string(sts.GetUID())] = struct{}{}
+					k.ownerCacheMu.Unlock()
+					foundWorkloads = append(foundWorkloads, sts)
+				}
+			}
+		}
+	}
+
+	// Проверяем DaemonSets
+	daemonsets, err := factory.Apps().V1().DaemonSets().Lister().DaemonSets(k.Namespace).List(labels.Everything())
+	if err != nil {
+		logger.WithError(err).Warning("Failed to list existing daemonsets")
+	} else {
+		for _, ds := range daemonsets {
+			if annotations := ds.GetAnnotations(); annotations != nil {
+				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
+					logger.WithFields(logrus.Fields{
+						"daemonset":   ds.GetNamespace() + "/" + ds.GetName(),
+						"tracking-id": v,
+					}).Info("Found existing matching daemonset")
+					k.ownerCacheMu.Lock()
+					k.topLevelUIDs[string(ds.GetUID())] = struct{}{}
+					k.ownerCacheMu.Unlock()
+					foundWorkloads = append(foundWorkloads, ds)
+				}
+			}
+		}
+	}
+
+	// Проверяем Jobs
+	jobs, err := factory.Batch().V1().Jobs().Lister().Jobs(k.Namespace).List(labels.Everything())
+	if err != nil {
+		logger.WithError(err).Warning("Failed to list existing jobs")
+	} else {
+		for _, job := range jobs {
+			if annotations := job.GetAnnotations(); annotations != nil {
+				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
+					logger.WithFields(logrus.Fields{
+						"job":         job.GetNamespace() + "/" + job.GetName(),
+						"tracking-id": v,
+					}).Info("Found existing matching job")
+					k.ownerCacheMu.Lock()
+					k.topLevelUIDs[string(job.GetUID())] = struct{}{}
+					k.ownerCacheMu.Unlock()
+					foundWorkloads = append(foundWorkloads, job)
+				}
+			}
+		}
+	}
+
+	// Проверяем CronJobs
+	cronjobs, err := factory.Batch().V1().CronJobs().Lister().CronJobs(k.Namespace).List(labels.Everything())
+	if err != nil {
+		logger.WithError(err).Warning("Failed to list existing cronjobs")
+	} else {
+		for _, cj := range cronjobs {
+			if annotations := cj.GetAnnotations(); annotations != nil {
+				if v, ok := annotations[trackingAnnotationKey]; ok && match(v) {
+					logger.WithFields(logrus.Fields{
+						"cronjob":     cj.GetNamespace() + "/" + cj.GetName(),
+						"tracking-id": v,
+					}).Info("Found existing matching cronjob")
+					k.ownerCacheMu.Lock()
+					k.topLevelUIDs[string(cj.GetUID())] = struct{}{}
+					k.ownerCacheMu.Unlock()
+					foundWorkloads = append(foundWorkloads, cj)
+				}
+			}
+		}
+	}
+
+	logger.WithField("count", len(foundWorkloads)).Info("Found existing matching workloads")
+
+	// Теперь найдем поды для этих workload'ов
+	if len(foundWorkloads) > 0 {
+		k.scanPodsForWorkloads(ctx)
+	}
+}
+
+// scanPodsForWorkloads - находит поды принадлежащие найденным workload'ам
+func (k *KubeLogStreamer) scanPodsForWorkloads(ctx context.Context) {
+	logger.Debug("Scanning pods for found workloads")
+	if k.podListerFunc == nil {
+		logger.Warning("Pod lister not ready, skipping pod scan")
+		return
+	}
+
+	pods, err := k.podListerFunc()
+	if err != nil {
+		logger.WithError(err).Warning("Failed to list pods for workloads")
+		return
+	}
+
+	processedCount := 0
+	for _, pod := range pods {
+		if k.podBelongsToTargets(ctx, pod) {
+			k.onPodWithExistingFlag(ctx, pod, true)
+			processedCount++
+		}
+	}
+
+	logger.WithFields(logrus.Fields{
+		"total_pods":     len(pods),
+		"processed_pods": processedCount,
+	}).Info("Completed pod scan for workloads")
+}
+
 // onPodEvent — обёртка
 func (k *KubeLogStreamer) onPodEvent(ctx context.Context, obj interface{}) {
 	pod, ok := obj.(*corev1.Pod)
@@ -500,40 +599,9 @@ func (k *KubeLogStreamer) maybeStartLogStream(ctx context.Context, pod *corev1.P
 			k.mu.Unlock()
 		}()
 
-		logger.WithField("stream", streamKey).Debug("Waiting for container to be ready")
-		k.waitContainerReady(ctx, pod.Name, container)
-
-		logOptions := &corev1.PodLogOptions{
-			Container:  container,
-			Follow:     true,
-			Timestamps: true,
-		}
-
-		// Для существующих подов показываем только последние 10 строк
-		if isExistingPod {
-			tailLines := int64(10)
-			logOptions.TailLines = &tailLines
-			fmt.Fprintf(k.Out, "[kubectl] logs --namespace=%s pod/%s -c %s --tail=10 (follow)\n", k.Namespace, pod.Name, container)
-		} else {
-			fmt.Fprintf(k.Out, "[kubectl] logs --namespace=%s pod/%s -c %s (follow)\n", k.Namespace, pod.Name, container)
-		}
-
-		logger.WithField("stream", streamKey).Debug("Creating log stream request")
-		req := k.Client.CoreV1().Pods(k.Namespace).GetLogs(pod.Name, logOptions)
-		stream, err := req.Stream(ctx)
-		if err != nil {
-			logger.WithField("stream", streamKey).WithError(err).Error("Failed to create log stream")
-			return
-		}
-		defer stream.Close()
-
-		logger.WithField("stream", streamKey).Info("Log stream established, copying logs")
-		prefix := fmt.Sprintf("[%s %s] ", pod.Name, container)
-		if err := copyWithPrefix(ctx, k.Out, stream, prefix); err != nil && err != context.Canceled {
-			logger.WithField("stream", streamKey).WithError(err).Warning("Error copying logs")
-			fmt.Fprintf(k.Out, "[warn] copy logs error pod=%s container=%s: %v\n", pod.Name, container, err)
-		} else {
-			logger.WithField("stream", streamKey).Info("Log stream ended normally")
+		// Use LogStreamer to handle the actual log streaming
+		if err := k.logStreamer.StartLogStream(ctx, pod.Name, container, isExistingPod); err != nil {
+			logger.WithField("stream", streamKey).WithError(err).Warning("Log stream ended with error")
 		}
 	}()
 }
@@ -728,91 +796,6 @@ func getOwnerRefs(kind, ns, name string, pod *corev1.Pod) []metav1.OwnerReferenc
 		return pod.OwnerReferences
 	}
 	return nil
-}
-
-func (k *KubeLogStreamer) waitContainerReady(ctx context.Context, podName, container string) {
-	streamKey := podName + "/" + container
-	logger.WithField("stream", streamKey).Debug("Waiting for container to be ready")
-
-	t := time.NewTicker(700 * time.Millisecond)
-	defer t.Stop()
-
-	checkCount := 0
-	for {
-		select {
-		case <-ctx.Done():
-			logger.WithField("stream", streamKey).Debug("Context cancelled while waiting for container")
-			return
-		case <-t.C:
-			checkCount++
-			pod, err := k.Client.CoreV1().Pods(k.Namespace).Get(ctx, podName, metav1.GetOptions{})
-			if err != nil {
-				logger.WithField("stream", streamKey).WithError(err).Warning("Failed to get pod while waiting for container")
-				return
-			}
-
-			for _, cs := range append(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses...) {
-				if cs.Name == container {
-					if cs.ContainerID != "" {
-						logger.WithFields(logrus.Fields{
-							"stream":       streamKey,
-							"container_id": cs.ContainerID,
-						}).Debug("Container is ready")
-						return
-					}
-					if checkCount%10 == 0 { // Log every 7 seconds
-						logger.WithFields(logrus.Fields{
-							"stream": streamKey,
-							"state":  fmt.Sprintf("%+v", cs.State),
-						}).Debug("Container still not ready")
-					}
-					break
-				}
-			}
-		}
-	}
-}
-
-func copyWithPrefix(ctx context.Context, dst io.Writer, src io.Reader, prefix string) error {
-	buf := make([]byte, 32*1024)
-	var line []byte
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			chunk := buf[:n]
-			for {
-				i := indexByte(chunk, '\n')
-				if i < 0 {
-					line = append(line, chunk...)
-					break
-				}
-				line = append(line, chunk[:i+1]...)
-				if _, werr := io.WriteString(dst, prefix+string(line)); werr != nil {
-					return werr
-				}
-				line = line[:0]
-				chunk = chunk[i+1:]
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				if len(line) > 0 {
-					_, _ = io.WriteString(dst, prefix+string(line))
-				}
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func indexByte(b []byte, c byte) int {
-	for i, v := range b {
-		if v == c {
-			return i
-		}
-	}
-	return -1
 }
 
 // makeTrackingMatcher — точное совпадение или "содержит" namespace и имя приложения
