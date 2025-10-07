@@ -135,11 +135,19 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	// Pod informer
 	logger.Debug("Setting up pod informer")
 	podInf := factory.Core().V1().Pods().Informer()
+	if podInf == nil {
+		logger.Error("Failed to create pod informer")
+		return fmt.Errorf("failed to create pod informer")
+	}
 
 	// Lazy wrapper for listing pods (used when new workloads appear)
 	k.podListerOnce.Do(func() {
 		logger.Debug("Initializing pod lister function")
 		lister := factory.Core().V1().Pods().Lister()
+		if lister == nil {
+			logger.Error("Failed to create pod lister")
+			return
+		}
 		k.podListerFunc = func() ([]*corev1.Pod, error) {
 			return lister.Pods(k.Namespace).List(labels.Everything())
 		}
@@ -147,10 +155,28 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 
 	// Processing pod events
 	logger.Debug("Adding pod event handlers")
-	podInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { k.onPodEvent(ctx, obj) },
-		UpdateFunc: func(_, newObj interface{}) { k.onPodEvent(ctx, newObj) },
+	_, err := podInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.WithField("panic", r).Error("Panic in pod add handler")
+				}
+			}()
+			k.onPodEvent(ctx, obj)
+		},
+		UpdateFunc: func(_, newObj interface{}) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.WithField("panic", r).Error("Panic in pod update handler")
+				}
+			}()
+			k.onPodEvent(ctx, newObj)
+		},
 	})
+	if err != nil {
+		logger.WithError(err).Error("Failed to add pod event handler")
+		return fmt.Errorf("failed to add pod event handler: %w", err)
+	}
 
 	// Start watchers for workloads and subscribe to their changes
 	logger.Debug("Starting workload watchers")
@@ -174,7 +200,10 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 
 	// After initial sync - find existing workloads and their pods
 	logger.Debug("Scanning existing workloads")
-	k.scanExistingWorkloads(ctx, factory)
+	if err := k.scanExistingWorkloads(ctx, factory); err != nil {
+		logger.WithError(err).Error("Failed to scan existing workloads")
+		return fmt.Errorf("failed to scan existing workloads: %w", err)
+	}
 
 	logger.Info("Log streaming active, waiting for context cancellation")
 	<-ctx.Done()
@@ -215,17 +244,17 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 	}
 
 	rescan := func() {
-		// Rescan pods when new workload appears - look for pods belonging to our workloads only
+		// Rescan pods when a new workload appears - look for pods belonging to our workloads only
 		logger.Debug("Rescanning pods due to new workload discovery")
 		k.scanPodsForWorkloads(ctx)
 	}
 
-	// Setup all workload watchers using workloads package
+	// Set up all workload watchers using the workloads package
 	workloads.SetupAllWorkloadWatchers(factory, k.Namespace, k.TrackingID, k.TrackingIDExact, addIfMatch, delUID, rescan)
 }
 
-// scanExistingWorkloads - finds existing workloads with needed tracking-id and their pods
-func (k *KubeLogStreamer) scanExistingWorkloads(ctx context.Context, factory informers.SharedInformerFactory) {
+// scanExistingWorkloads - finds existing workloads with necessary tracking-id and their pods
+func (k *KubeLogStreamer) scanExistingWorkloads(ctx context.Context, factory informers.SharedInformerFactory) error {
 	addToCache := func(uid string) {
 		k.ownerCacheMu.Lock()
 		k.topLevelUIDs[uid] = struct{}{}
@@ -238,26 +267,39 @@ func (k *KubeLogStreamer) scanExistingWorkloads(ctx context.Context, factory inf
 
 	// Now find pods for these workloads
 	if len(foundWorkloads) > 0 {
-		k.scanPodsForWorkloads(ctx)
+		if err := k.scanPodsForWorkloads(ctx); err != nil {
+			logger.WithError(err).Error("Failed to scan pods for existing workloads")
+			return fmt.Errorf("failed to scan pods for existing workloads: %w", err)
+		}
 	}
+
+	return nil
 }
 
 // scanPodsForWorkloads - finds pods belonging to found workloads
-func (k *KubeLogStreamer) scanPodsForWorkloads(ctx context.Context) {
+func (k *KubeLogStreamer) scanPodsForWorkloads(ctx context.Context) error {
 	logger.Debug("Scanning pods for found workloads")
 	if k.podListerFunc == nil {
 		logger.Warning("Pod lister not ready, skipping pod scan")
-		return
+		return fmt.Errorf("pod lister not ready")
 	}
 
 	pods, err := k.podListerFunc()
 	if err != nil {
-		logger.WithError(err).Warning("Failed to list pods for workloads")
-		return
+		logger.WithError(err).Error("Failed to list pods for workloads")
+		return fmt.Errorf("failed to list pods for workloads: %w", err)
 	}
 
 	processedCount := 0
 	for _, pod := range pods {
+		// Check context before processing each pod
+		select {
+		case <-ctx.Done():
+			logger.WithError(ctx.Err()).Debug("Context cancelled during pod scanning")
+			return ctx.Err()
+		default:
+		}
+
 		if k.podBelongsToTargets(ctx, pod) {
 			k.onPodWithExistingFlag(ctx, pod, true)
 			processedCount++
@@ -268,6 +310,8 @@ func (k *KubeLogStreamer) scanPodsForWorkloads(ctx context.Context) {
 		"total_pods":     len(pods),
 		"processed_pods": processedCount,
 	}).Info("Completed pod scan for workloads")
+
+	return nil
 }
 
 // onPodEvent - wrapper function
@@ -350,6 +394,13 @@ func (k *KubeLogStreamer) maybeStartLogStream(ctx context.Context, pod *corev1.P
 
 	go func() {
 		defer func() {
+			if r := recover(); r != nil {
+				logger.WithFields(logrus.Fields{
+					"stream": streamKey,
+					"panic":  r,
+				}).Error("Panic in log stream goroutine")
+			}
+
 			logger.WithField("stream", streamKey).Debug("Cleaning up log stream")
 			k.mu.Lock()
 			delete(k.activeStreams, key)
@@ -358,7 +409,20 @@ func (k *KubeLogStreamer) maybeStartLogStream(ctx context.Context, pod *corev1.P
 
 		// Use LogStreamer to handle the actual log streaming
 		if err := k.logStreamer.StartLogStream(ctx, pod.Name, container, isExistingPod); err != nil {
-			logger.WithField("stream", streamKey).WithError(err).Warning("Log stream ended with error")
+			// Check if the error is due to context cancellation
+			if ctx.Err() != nil {
+				logger.WithFields(logrus.Fields{
+					"stream":      streamKey,
+					"context_err": ctx.Err().Error(),
+				}).Debug("Log stream ended due to context cancellation")
+			} else {
+				logger.WithFields(logrus.Fields{
+					"stream": streamKey,
+					"error":  err.Error(),
+				}).Error("Log stream ended with error")
+			}
+		} else {
+			logger.WithField("stream", streamKey).Debug("Log stream ended successfully")
 		}
 	}()
 }

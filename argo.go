@@ -13,39 +13,39 @@ import (
 // getOutputPrefix determines the prefix for an output line based on its content
 func getOutputPrefix(line string) string {
 	// Check for Kubernetes events and logs
-	kubeIndicators := []string{
-		"Event:",
-		"Events:",
-		"kubectl",
-		"pod/",
-		"deployment/",
-		"service/",
-		"configmap/",
-		"secret/",
-		"namespace/",
-		"Warning",
-		"Normal",
-		"FailedMount",
-		"Scheduled",
-		"Pulled",
-		"Created",
-		"Started",
-		"Killing",
-		"logs",
-		"NAMESPACE",
-		"NAME",
-		"READY",
-		"STATUS",
-		"RESTARTS",
-		"AGE",
-	}
-
-	lineLower := strings.ToLower(line)
-	for _, indicator := range kubeIndicators {
-		if strings.Contains(lineLower, strings.ToLower(indicator)) {
-			return "[kube]"
-		}
-	}
+	//kubeIndicators := []string{
+	//	"Event:",
+	//	"Events:",
+	//	"kubectl",
+	//	"pod/",
+	//	"deployment/",
+	//	"service/",
+	//	"configmap/",
+	//	"secret/",
+	//	"namespace/",
+	//	"Warning",
+	//	"Normal",
+	//	"FailedMount",
+	//	"Scheduled",
+	//	"Pulled",
+	//	"Created",
+	//	"Started",
+	//	"Killing",
+	//	"logs",
+	//	"NAMESPACE",
+	//	"NAME",
+	//	"READY",
+	//	"STATUS",
+	//	"RESTARTS",
+	//	"AGE",
+	//}
+	//
+	//lineLower := strings.ToLower(line)
+	//for _, indicator := range kubeIndicators {
+	//	if strings.Contains(lineLower, strings.ToLower(indicator)) {
+	//		return "[kube]"
+	//	}
+	//}
 
 	// By default, consider everything else as ArgoCD output
 	return "[argo]"
