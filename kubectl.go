@@ -4,6 +4,7 @@ package main
 import (
 	"argocd-watcher/eventsPipe"
 	"argocd-watcher/logsPipe"
+	"argocd-watcher/workloadFinder"
 	"argocd-watcher/workloads"
 	"context"
 	"fmt"
@@ -46,9 +47,6 @@ type KubeLogStreamer struct {
 	mu            sync.Mutex
 	activeStreams map[PodContainerKey]struct{}
 
-	ownerCacheMu sync.Mutex
-	topLevelUIDs map[string]struct{} // UIDs of top-level workloads (Deployment/StatefulSet/DaemonSet/Job/CronJob)
-
 	// for rescanning pods when new workloads appear
 	podListerOnce sync.Once
 	podListerFunc func() ([]*corev1.Pod, error)
@@ -58,6 +56,9 @@ type KubeLogStreamer struct {
 
 	// event handler for processing Kubernetes events
 	eventHandler *eventsPipe.EventHandler
+
+	// workload finder for determining pod ownership
+	workloadFinder *workloadFinder.WorkloadFinder
 }
 
 func createKubernetesClient() (*kubernetes.Clientset, *rest.Config, error) {
@@ -113,9 +114,9 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		TrackingIDExact: exact,
 		Out:             out,
 		activeStreams:   make(map[PodContainerKey]struct{}),
-		topLevelUIDs:    make(map[string]struct{}),
 		logStreamer:     logsPipe.NewLogStreamer(kubeClient, namespace, out, logger),
 		eventHandler:    eventsPipe.NewEventHandler(kubeClient, namespace, logger),
+		workloadFinder:  workloadFinder.NewWorkloadFinder(kubeClient, logger),
 	}
 
 	logger.Info("KubeLogStreamer successfully created")
@@ -260,10 +261,7 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 			"tracking-id": obj.GetAnnotations()[trackingAnnotationKey],
 		}).Info("Found matching workload")
 
-		k.ownerCacheMu.Lock()
-		_, existed := k.topLevelUIDs[string(obj.GetUID())]
-		k.topLevelUIDs[string(obj.GetUID())] = struct{}{}
-		k.ownerCacheMu.Unlock()
+		existed := !k.workloadFinder.AddTopLevelUID(string(obj.GetUID()))
 
 		if !existed {
 			logger.WithFields(logrus.Fields{
@@ -278,9 +276,7 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 			"uid":      string(obj.GetUID()),
 			"workload": obj.GetNamespace() + "/" + obj.GetName(),
 		}).Debug("Removing UID from tracking")
-		k.ownerCacheMu.Lock()
-		delete(k.topLevelUIDs, string(obj.GetUID()))
-		k.ownerCacheMu.Unlock()
+		k.workloadFinder.RemoveTopLevelUID(string(obj.GetUID()))
 	}
 
 	rescan := func() {
@@ -296,9 +292,7 @@ func (k *KubeLogStreamer) startWorkloadWatchers(ctx context.Context, factory inf
 // scanExistingWorkloads - finds existing workloads with necessary tracking-id and their pods
 func (k *KubeLogStreamer) scanExistingWorkloads(ctx context.Context, factory informers.SharedInformerFactory) error {
 	addToCache := func(uid string) {
-		k.ownerCacheMu.Lock()
-		k.topLevelUIDs[uid] = struct{}{}
-		k.ownerCacheMu.Unlock()
+		k.workloadFinder.AddTopLevelUID(uid)
 	}
 
 	foundWorkloads := workloads.ScanAllExistingWorkloads(factory, k.Namespace, k.TrackingID, k.TrackingIDExact, addToCache)
@@ -308,8 +302,11 @@ func (k *KubeLogStreamer) scanExistingWorkloads(ctx context.Context, factory inf
 	// Now find pods for these workloads
 	if len(foundWorkloads) > 0 {
 		if err := k.scanPodsForWorkloads(ctx); err != nil {
-			logger.WithError(err).Error("Failed to scan pods for existing workloads")
-			return fmt.Errorf("failed to scan pods for existing workloads: %w", err)
+			if err.Error() != "context canceled" {
+				logger.WithError(err).Error("Failed to scan pods for existing workloads")
+				return fmt.Errorf("failed to scan pods for existing workloads: %w", err)
+			}
+
 		}
 	}
 
@@ -477,290 +474,7 @@ func (k *KubeLogStreamer) PodBelongsToTargets(ctx context.Context, pod *corev1.P
 	return k.podBelongsToTargets(ctx, pod)
 }
 
-// traverse ownerReferences up to top-level and check inclusion in k.topLevelUIDs
+// podBelongsToTargets delegates to workloadFinder for ownership checking
 func (k *KubeLogStreamer) podBelongsToTargets(ctx context.Context, pod *corev1.Pod) bool {
-	//logger.WithField("pod", pod.Name).Debug("Checking ownership chain")
-
-	visited := map[string]bool{}
-	var (
-		kind string = "Pod"
-		uid  string = string(pod.UID)
-		ns          = pod.Namespace
-		name        = pod.Name
-	)
-
-	for {
-		key := kind + "/" + uid
-		if visited[key] {
-			logger.WithField("key", key).Warning("Circular reference detected in ownership chain")
-			return false
-		}
-		visited[key] = true
-
-		logger.WithFields(logrus.Fields{
-			"kind": kind,
-			"name": ns + "/" + name,
-			"uid":  uid,
-		}).Debug("Checking if resource is a top-level target")
-
-		k.ownerCacheMu.Lock()
-		_, ok := k.topLevelUIDs[uid]
-		k.ownerCacheMu.Unlock()
-		if ok {
-			logger.WithFields(logrus.Fields{
-				"kind": kind,
-				"name": ns + "/" + name,
-			}).Debug("Found matching target workload")
-			return true
-		}
-
-		var owner *metav1.OwnerReference
-		ownerRefs := getOwnerRefs(kind, ns, name, pod)
-		for i := range ownerRefs {
-			or := &ownerRefs[i]
-			if or.Controller != nil && *or.Controller {
-				owner = or
-				break
-			}
-		}
-		if owner == nil {
-			logger.WithFields(logrus.Fields{
-				"kind": kind,
-				"name": ns + "/" + name,
-			}).Debug("No controller owner found")
-			return false
-		}
-
-		logger.WithFields(logrus.Fields{
-			"owner_kind": owner.Kind,
-			"owner_name": owner.Name,
-			"owner_uid":  owner.UID,
-		}).Debug("Found controller owner")
-
-		switch owner.Kind {
-		case "ReplicaSet":
-			// Check if context is already cancelled before making API call
-			select {
-			case <-ctx.Done():
-				logger.WithField("replicaset", ns+"/"+owner.Name).Debug("Context cancelled, skipping ReplicaSet lookup")
-				return false
-			default:
-			}
-
-			rs, err := k.Client.AppsV1().ReplicaSets(ns).Get(ctx, owner.Name, metav1.GetOptions{})
-			if err != nil {
-				// Check for specific error types
-				if ctx.Err() != nil {
-					logger.WithFields(logrus.Fields{
-						"replicaset":  ns + "/" + owner.Name,
-						"context_err": ctx.Err().Error(),
-					}).Debug("Context cancelled during ReplicaSet lookup")
-					return false
-				}
-				logger.WithField("replicaset", ns+"/"+owner.Name).WithError(err).Warning("Failed to get ReplicaSet")
-				return false
-			}
-			kind, uid, name = "ReplicaSet", string(rs.UID), rs.Name
-			logger.WithField("replicaset", ns+"/"+name).Debug("Moving up ownership chain to ReplicaSet")
-			if hasTopOwnerUID(k, rs.OwnerReferences) {
-				logger.WithField("replicaset", ns+"/"+name).Debug("ReplicaSet has top-level owner")
-				return true
-			}
-			if or := firstController(rs.OwnerReferences); or != nil {
-				owner = or
-			} else {
-				logger.WithField("replicaset", ns+"/"+name).Debug("ReplicaSet has no controller owner")
-				return false
-			}
-			continue
-		case "StatefulSet":
-			// Check if context is already cancelled before making API call
-			select {
-			case <-ctx.Done():
-				logger.WithField("statefulset", ns+"/"+owner.Name).Debug("Context cancelled, skipping StatefulSet lookup")
-				return false
-			default:
-			}
-
-			ss, err := k.Client.AppsV1().StatefulSets(ns).Get(ctx, owner.Name, metav1.GetOptions{})
-			if err != nil {
-				// Check for specific error types
-				if ctx.Err() != nil {
-					logger.WithFields(logrus.Fields{
-						"statefulset": ns + "/" + owner.Name,
-						"context_err": ctx.Err().Error(),
-					}).Debug("Context cancelled during StatefulSet lookup")
-					return false
-				}
-				logger.WithField("statefulset", ns+"/"+owner.Name).WithError(err).Warning("Failed to get StatefulSet")
-				return false
-			}
-			result := k.uidIsTop(string(ss.UID))
-			logger.WithFields(logrus.Fields{
-				"statefulset": ns + "/" + owner.Name,
-				"is_target":   result,
-			}).Debug("Checked StatefulSet target status")
-			return result
-		case "DaemonSet":
-			// Check if context is already cancelled before making API call
-			select {
-			case <-ctx.Done():
-				logger.WithField("daemonset", ns+"/"+owner.Name).Debug("Context cancelled, skipping DaemonSet lookup")
-				return false
-			default:
-			}
-
-			ds, err := k.Client.AppsV1().DaemonSets(ns).Get(ctx, owner.Name, metav1.GetOptions{})
-			if err != nil {
-				// Check for specific error types
-				if ctx.Err() != nil {
-					logger.WithFields(logrus.Fields{
-						"daemonset":   ns + "/" + owner.Name,
-						"context_err": ctx.Err().Error(),
-					}).Debug("Context cancelled during DaemonSet lookup")
-					return false
-				}
-				logger.WithField("daemonset", ns+"/"+owner.Name).WithError(err).Warning("Failed to get DaemonSet")
-				return false
-			}
-			result := k.uidIsTop(string(ds.UID))
-			logger.WithFields(logrus.Fields{
-				"daemonset": ns + "/" + owner.Name,
-				"is_target": result,
-			}).Debug("Checked DaemonSet target status")
-			return result
-		case "Job":
-			// Check if context is already cancelled before making API call
-			select {
-			case <-ctx.Done():
-				logger.WithField("job", ns+"/"+owner.Name).Debug("Context cancelled, skipping Job lookup")
-				return false
-			default:
-			}
-
-			job, err := k.Client.BatchV1().Jobs(ns).Get(ctx, owner.Name, metav1.GetOptions{})
-			if err != nil {
-				// Check for specific error types
-				if ctx.Err() != nil {
-					logger.WithFields(logrus.Fields{
-						"job":         ns + "/" + owner.Name,
-						"context_err": ctx.Err().Error(),
-					}).Debug("Context cancelled during Job lookup")
-					return false
-				}
-				logger.WithField("job", ns+"/"+owner.Name).WithError(err).Warning("Failed to get Job")
-				return false
-			}
-			if hasTopOwnerUID(k, job.OwnerReferences) {
-				logger.WithField("job", ns+"/"+owner.Name).Debug("Job has top-level owner")
-				return true
-			}
-			if or := firstController(job.OwnerReferences); or != nil {
-				owner = or
-				continue
-			}
-			result := k.uidIsTop(string(job.UID))
-			logger.WithFields(logrus.Fields{
-				"job":       ns + "/" + owner.Name,
-				"is_target": result,
-			}).Debug("Checked Job target status")
-			return result
-		case "Deployment":
-			// Check if context is already cancelled before making API call
-			select {
-			case <-ctx.Done():
-				logger.WithField("deployment", ns+"/"+owner.Name).Debug("Context cancelled, skipping Deployment lookup")
-				return false
-			default:
-			}
-
-			dep, err := k.Client.AppsV1().Deployments(ns).Get(ctx, owner.Name, metav1.GetOptions{})
-			if err != nil {
-				// Check for specific error types
-				if ctx.Err() != nil {
-					logger.WithFields(logrus.Fields{
-						"deployment":  ns + "/" + owner.Name,
-						"context_err": ctx.Err().Error(),
-					}).Debug("Context cancelled during Deployment lookup")
-					return false
-				}
-				logger.WithField("deployment", ns+"/"+owner.Name).WithError(err).Warning("Failed to get Deployment")
-				return false
-			}
-			result := k.uidIsTop(string(dep.UID))
-			logger.WithFields(logrus.Fields{
-				"deployment": ns + "/" + owner.Name,
-				"is_target":  result,
-			}).Debug("Checked Deployment target status")
-			return result
-		case "CronJob":
-			// Check if context is already cancelled before making API call
-			select {
-			case <-ctx.Done():
-				logger.WithField("cronjob", ns+"/"+owner.Name).Debug("Context cancelled, skipping CronJob lookup")
-				return false
-			default:
-			}
-
-			cj, err := k.Client.BatchV1().CronJobs(ns).Get(ctx, owner.Name, metav1.GetOptions{})
-			if err != nil {
-				// Check for specific error types
-				if ctx.Err() != nil {
-					logger.WithFields(logrus.Fields{
-						"cronjob":     ns + "/" + owner.Name,
-						"context_err": ctx.Err().Error(),
-					}).Debug("Context cancelled during CronJob lookup")
-					return false
-				}
-				logger.WithField("cronjob", ns+"/"+owner.Name).WithError(err).Warning("Failed to get CronJob")
-				return false
-			}
-			result := k.uidIsTop(string(cj.UID))
-			logger.WithFields(logrus.Fields{
-				"cronjob":   ns + "/" + owner.Name,
-				"is_target": result,
-			}).Debug("Checked CronJob target status")
-			return result
-		default:
-			logger.WithFields(logrus.Fields{
-				"owner_kind": owner.Kind,
-				"owner_name": ns + "/" + owner.Name,
-			}).Warning("Unknown owner kind")
-			return false
-		}
-	}
-}
-
-func (k *KubeLogStreamer) uidIsTop(uid string) bool {
-	k.ownerCacheMu.Lock()
-	defer k.ownerCacheMu.Unlock()
-	_, ok := k.topLevelUIDs[uid]
-	return ok
-}
-
-func hasTopOwnerUID(k *KubeLogStreamer, ors []metav1.OwnerReference) bool {
-	k.ownerCacheMu.Lock()
-	defer k.ownerCacheMu.Unlock()
-	for _, or := range ors {
-		if _, ok := k.topLevelUIDs[string(or.UID)]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func firstController(ors []metav1.OwnerReference) *metav1.OwnerReference {
-	for i := range ors {
-		if ors[i].Controller != nil && *ors[i].Controller {
-			return &ors[i]
-		}
-	}
-	return nil
-}
-
-func getOwnerRefs(kind, ns, name string, pod *corev1.Pod) []metav1.OwnerReference {
-	if kind == "Pod" {
-		return pod.OwnerReferences
-	}
-	return nil
+	return k.workloadFinder.PodBelongsToTargets(ctx, pod, k.Namespace)
 }
