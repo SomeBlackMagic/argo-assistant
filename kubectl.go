@@ -53,6 +53,10 @@ type KubeLogStreamer struct {
 
 	// log streamer for formatting output
 	logStreamer *LogStreamer
+
+	// track last seen event time per pod
+	eventTimestampMu sync.Mutex
+	lastEventTime    map[string]time.Time // podName -> last event timestamp
 }
 
 func createKubernetesClient() (*kubernetes.Clientset, *rest.Config, error) {
@@ -110,6 +114,7 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		activeStreams:   make(map[PodContainerKey]struct{}),
 		topLevelUIDs:    make(map[string]struct{}),
 		logStreamer:     NewLogStreamer(kubeClient, namespace, out),
+		lastEventTime:   make(map[string]time.Time),
 	}
 
 	logger.Info("KubeLogStreamer successfully created")
@@ -138,6 +143,14 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	if podInf == nil {
 		logger.Error("Failed to create pod informer")
 		return fmt.Errorf("failed to create pod informer")
+	}
+
+	// Event informer
+	logger.Debug("Setting up event informer")
+	eventInf := factory.Core().V1().Events().Informer()
+	if eventInf == nil {
+		logger.Error("Failed to create event informer")
+		return fmt.Errorf("failed to create event informer")
 	}
 
 	// Lazy wrapper for listing pods (used when new workloads appear)
@@ -178,6 +191,31 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 		return fmt.Errorf("failed to add pod event handler: %w", err)
 	}
 
+	// Processing Kubernetes events
+	logger.Debug("Adding event handlers")
+	_, err = eventInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.WithField("panic", r).Error("Panic in event add handler")
+				}
+			}()
+			k.onEvent(ctx, obj)
+		},
+		UpdateFunc: func(_, newObj interface{}) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.WithField("panic", r).Error("Panic in event update handler")
+				}
+			}()
+			k.onEvent(ctx, newObj)
+		},
+	})
+	if err != nil {
+		logger.WithError(err).Error("Failed to add event handler")
+		return fmt.Errorf("failed to add event handler: %w", err)
+	}
+
 	// Start watchers for workloads and subscribe to their changes
 	logger.Debug("Starting workload watchers")
 	k.startWorkloadWatchers(ctx, factory)
@@ -191,6 +229,7 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	logger.Info("Waiting for cache sync...")
 	if !cache.WaitForCacheSync(ctx.Done(),
 		podInf.HasSynced,
+		eventInf.HasSynced,
 		// Sync of all needed caches will happen inside startWorkloadWatchers through the same factory
 	) {
 		logger.Error("Cache sync failed")
@@ -425,6 +464,60 @@ func (k *KubeLogStreamer) maybeStartLogStream(ctx context.Context, pod *corev1.P
 			logger.WithField("stream", streamKey).Debug("Log stream ended successfully")
 		}
 	}()
+}
+
+// onEvent handles Kubernetes events and outputs them for pods that belong to our tracked workloads
+func (k *KubeLogStreamer) onEvent(ctx context.Context, obj interface{}) {
+	event, ok := obj.(*corev1.Event)
+	if !ok {
+		logger.WithField("type", fmt.Sprintf("%T", obj)).Warning("Received non-event object in event handler")
+		return
+	}
+
+	// Only process events related to pods
+	if event.InvolvedObject.Kind != "Pod" {
+		return
+	}
+
+	// Get the pod name from the event
+	podName := event.InvolvedObject.Name
+
+	// Check if we have already seen this exact event (based on timestamp and message)
+	eventKey := podName
+	k.eventTimestampMu.Lock()
+	lastTime, exists := k.lastEventTime[eventKey]
+
+	// Skip if we've seen a newer or equal event for this pod
+	if exists && !event.LastTimestamp.Time.After(lastTime) {
+		k.eventTimestampMu.Unlock()
+		return
+	}
+
+	k.lastEventTime[eventKey] = event.LastTimestamp.Time
+	k.eventTimestampMu.Unlock()
+
+	// Check if the pod belongs to our tracked workloads
+	// We need to fetch the pod to check ownership
+	pod, err := k.Client.CoreV1().Pods(k.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		// Pod might have been deleted, but we still want to show the event
+		logger.WithField("pod", podName).WithError(err).Debug("Could not fetch pod for event, skipping ownership check")
+		return
+	}
+
+	if !k.podBelongsToTargets(ctx, pod) {
+		return
+	}
+
+	// Format and output the event
+	timestamp := event.LastTimestamp.Time.Format("2006-01-02T15:04:05Z")
+	eventType := event.Type
+	reason := event.Reason
+	message := event.Message
+	count := event.Count
+
+	fmt.Fprintf(k.Out, "[EVENT] Pod: %s | Type: %s | Reason: %s | Count: %d | Time: %s | Message: %s\n",
+		podName, eventType, reason, count, timestamp, message)
 }
 
 // traverse ownerReferences up to top-level and check inclusion in k.topLevelUIDs
