@@ -55,8 +55,8 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 	// Create base components
 	wf := workloadFinder.NewWorkloadFinder(kubeClient, logger)
 	logStreamer := logsPipe.NewLogStreamer(kubeClient, namespace, out, logger)
-	streamCoord := streaming.NewCoordinator(logStreamer, logger)
-	podHandler := pod.NewHandler(namespace, wf, streamCoord, logger)
+	streamCoordinator := streaming.NewCoordinator(logStreamer, logger)
+	podHandler := pod.NewHandler(namespace, wf, streamCoordinator, logger)
 	informerMgr := informer.NewManager(kubeClient, namespace, logger)
 
 	streamer := &KubeLogStreamer{
@@ -67,7 +67,7 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		TrackingIDExact:   exact,
 		Out:               out,
 		informerManager:   informerMgr,
-		streamCoordinator: streamCoord,
+		streamCoordinator: streamCoordinator,
 		podHandler:        podHandler,
 		eventHandler:      eventsPipe.NewEventHandler(kubeClient, namespace, logger),
 		workloadFinder:    wf,
@@ -84,7 +84,7 @@ func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 		"trackingID": k.TrackingID,
 	}).Info("Starting log streaming")
 
-	// Setup pod informer with handlers
+	// Set up pod informer with handlers
 	if err := k.informerManager.SetupPodInformer(
 		func(obj interface{}) {
 			defer recoverPanic("pod add handler")
