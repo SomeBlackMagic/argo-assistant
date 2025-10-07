@@ -516,8 +516,8 @@ func (k *KubeLogStreamer) onEvent(ctx context.Context, obj interface{}) {
 	message := event.Message
 	count := event.Count
 
-	fmt.Fprintf(k.Out, "[EVENT] Pod: %s | Type: %s | Reason: %s | Count: %d | Time: %s | Message: %s\n",
-		podName, eventType, reason, count, timestamp, message)
+	fmt.Fprintf(k.Out, "[%s] [EVENT] %s | Type: %s | Reason: %s | Count: %d | %s\n",
+		podName, timestamp, eventType, reason, count, message)
 }
 
 // traverse ownerReferences up to top-level and check inclusion in k.topLevelUIDs

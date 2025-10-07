@@ -72,9 +72,18 @@ func (ls *LogStreamer) StartLogStream(ctx context.Context, podName, containerNam
 	if isExistingPod {
 		tailLines := int64(10)
 		logOptions.TailLines = &tailLines
-		fmt.Fprintf(ls.out, "[kubectl] logs --namespace=%s pod/%s -c %s --tail=10 (follow)\n", ls.namespace, podName, containerName)
+		logger.WithFields(logrus.Fields{
+			"namespace": ls.namespace,
+			"pod":       podName,
+			"container": containerName,
+			"tail":      10,
+		}).Debug("Starting log stream for existing pod with tail")
 	} else {
-		fmt.Fprintf(ls.out, "[kubectl] logs --namespace=%s pod/%s -c %s (follow)\n", ls.namespace, podName, containerName)
+		logger.WithFields(logrus.Fields{
+			"namespace": ls.namespace,
+			"pod":       podName,
+			"container": containerName,
+		}).Debug("Starting log stream for new pod")
 	}
 
 	req := ls.client.CoreV1().Pods(ls.namespace).GetLogs(podName, logOptions)
@@ -85,10 +94,13 @@ func (ls *LogStreamer) StartLogStream(ctx context.Context, podName, containerNam
 	}
 	defer stream.Close()
 
-	prefix := fmt.Sprintf("[%s %s] ", podName, containerName)
+	prefix := fmt.Sprintf("[%s] [LOG] ", podName)
 	if err := copyWithPrefix(ctx, ls.out, stream, prefix); err != nil && err != context.Canceled {
-		logger.WithField("stream", streamKey).WithError(err).Warning("Error copying logs")
-		fmt.Fprintf(ls.out, "[warn] copy logs error pod=%s container=%s: %v\n", podName, containerName, err)
+		logger.WithFields(logrus.Fields{
+			"stream":    streamKey,
+			"pod":       podName,
+			"container": containerName,
+		}).WithError(err).Warning("Error copying logs")
 		return err
 	}
 	return nil

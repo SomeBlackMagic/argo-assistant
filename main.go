@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"sync"
@@ -13,11 +12,16 @@ func main() {
 	argocd := getEnvStrict("ARGOCD", "argocd")
 
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <app-name> <app-namespace>\n", os.Args[0])
+		logger.Errorf("Usage: %s <app-name> <app-namespace>", os.Args[0])
 		os.Exit(1)
 	}
 	appName := os.Args[1]
 	namespace := os.Args[2]
+
+	logger.WithFields(map[string]interface{}{
+		"app":       appName,
+		"namespace": namespace,
+	}).Info("Starting argo-assistant")
 
 	// Context with cancellation and signal handling
 	ctx, cancel := context.WithCancel(context.Background())
@@ -37,7 +41,7 @@ func main() {
 		defer wg.Done()
 		streamer := NewKubeLogStreamer(namespace, appName, false, os.Stdout)
 		if err := streamer.StreamLogsByTrackingID(logCtx); err != nil && err != context.Canceled {
-			fmt.Fprintf(os.Stderr, "Log streaming error: %v\n", err)
+			logger.WithError(err).Error("Log streaming error")
 		}
 	}()
 
@@ -57,7 +61,7 @@ func getEnvStrict(name, defaultVal string) string {
 		if defaultVal != "" {
 			return defaultVal
 		}
-		fmt.Fprintf(os.Stderr, "Required environment variable %s is not set\n", name)
+		logger.Errorf("Required environment variable %s is not set", name)
 		os.Exit(1)
 	}
 	return v

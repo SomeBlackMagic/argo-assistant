@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/sirupsen/logrus"
 )
 
 // getOutputPrefix determines the prefix for an output line based on its content
@@ -56,20 +58,25 @@ func getOutputPrefix(line string) string {
 // Only environment variables with "ARGO" prefix are passed to subprocess.
 func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int {
 	args := []string{"app", "wait", appName, "--app-namespace=" + namespace, "--health", "--sync", "--grpc-web"}
-	fmt.Fprintln(os.Stderr, "[exec]", argocdBin, strings.Join(args, " "))
+	logger.WithFields(logrus.Fields{
+		"command":   argocdBin,
+		"args":      strings.Join(args, " "),
+		"app":       appName,
+		"namespace": namespace,
+	}).Info("Executing argocd command")
 
 	cmd := exec.CommandContext(ctx, argocdBin, args...)
 
 	// Get pipes for stdout and stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
+		logger.WithError(err).Error("Error creating stdout pipe")
 		return 1
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating stderr pipe: %v\n", err)
+		logger.WithError(err).Error("Error creating stderr pipe")
 		return 1
 	}
 
@@ -88,7 +95,7 @@ func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int 
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error starting command: %v\n", err)
+		logger.WithError(err).Error("Error starting command")
 		return 1
 	}
 
@@ -114,7 +121,10 @@ func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int 
 		for scanner.Scan() {
 			line := scanner.Text()
 			prefix := getOutputPrefix(line)
-			fmt.Fprintf(os.Stderr, "%s %s\n", prefix, line)
+			logger.WithFields(logrus.Fields{
+				"prefix": prefix,
+				"source": "stderr",
+			}).Warn(line)
 		}
 	}()
 
@@ -126,8 +136,11 @@ func RunArgoWait(ctx context.Context, argocdBin, appName, namespace string) int 
 		return 0
 	}
 	if ee, ok := err.(*exec.ExitError); ok {
+		logger.WithFields(logrus.Fields{
+			"exit_code": ee.ExitCode(),
+		}).Error("Argocd command exited with error")
 		return ee.ExitCode()
 	}
-	fmt.Fprintln(os.Stderr, "Error starting argocd:", err)
+	logger.WithError(err).Error("Error running argocd command")
 	return 1
 }
