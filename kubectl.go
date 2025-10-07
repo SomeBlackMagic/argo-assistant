@@ -123,7 +123,7 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 	return streamer
 }
 
-// StreamLogsByTrackingID: sets up informers for workloads (waiting for them to appear) and for pods,
+// StreamLogsByTrackingID StreamLogsByTrackingID: sets up informers for workloads (waiting for them to appear) and for pods,
 // then works until the context is cancelled.
 func (k *KubeLogStreamer) StreamLogsByTrackingID(ctx context.Context) error {
 	logger.WithFields(logrus.Fields{
