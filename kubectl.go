@@ -2,6 +2,8 @@
 package main
 
 import (
+	"argocd-watcher/eventsPipe"
+	"argocd-watcher/logsPipe"
 	"argocd-watcher/workloads"
 	"context"
 	"fmt"
@@ -52,11 +54,10 @@ type KubeLogStreamer struct {
 	podListerFunc func() ([]*corev1.Pod, error)
 
 	// log streamer for formatting output
-	logStreamer *LogStreamer
+	logStreamer *logsPipe.LogStreamer
 
-	// track last seen event time per pod
-	eventTimestampMu sync.Mutex
-	lastEventTime    map[string]time.Time // podName -> last event timestamp
+	// event handler for processing Kubernetes events
+	eventHandler *eventsPipe.EventHandler
 }
 
 func createKubernetesClient() (*kubernetes.Clientset, *rest.Config, error) {
@@ -113,8 +114,8 @@ func NewKubeLogStreamer(namespace, trackingID string, exact bool, out io.Writer)
 		Out:             out,
 		activeStreams:   make(map[PodContainerKey]struct{}),
 		topLevelUIDs:    make(map[string]struct{}),
-		logStreamer:     NewLogStreamer(kubeClient, namespace, out),
-		lastEventTime:   make(map[string]time.Time),
+		logStreamer:     logsPipe.NewLogStreamer(kubeClient, namespace, out, logger),
+		eventHandler:    eventsPipe.NewEventHandler(kubeClient, namespace, logger),
 	}
 
 	logger.Info("KubeLogStreamer successfully created")
@@ -468,79 +469,12 @@ func (k *KubeLogStreamer) maybeStartLogStream(ctx context.Context, pod *corev1.P
 
 // onEvent handles Kubernetes events and outputs them for pods that belong to our tracked workloads
 func (k *KubeLogStreamer) onEvent(ctx context.Context, obj interface{}) {
-	event, ok := obj.(*corev1.Event)
-	if !ok {
-		logger.WithField("type", fmt.Sprintf("%T", obj)).Warning("Received non-event object in event handler")
-		return
-	}
+	k.eventHandler.HandleEvent(ctx, obj, k)
+}
 
-	// Only process events related to pods
-	if event.InvolvedObject.Kind != "Pod" {
-		return
-	}
-
-	// Get the pod name from the event
-	podName := event.InvolvedObject.Name
-
-	// Check if we have already seen this exact event (based on timestamp and message)
-	eventKey := podName
-	k.eventTimestampMu.Lock()
-	lastTime, exists := k.lastEventTime[eventKey]
-
-	// Skip if we've seen a newer or equal event for this pod
-	if exists && !event.LastTimestamp.Time.After(lastTime) {
-		k.eventTimestampMu.Unlock()
-		return
-	}
-
-	k.lastEventTime[eventKey] = event.LastTimestamp.Time
-	k.eventTimestampMu.Unlock()
-
-	// Check if the pod belongs to our tracked workloads
-	// We need to fetch the pod to check ownership
-	pod, err := k.Client.CoreV1().Pods(k.Namespace).Get(ctx, podName, metav1.GetOptions{})
-	if err != nil {
-		// Pod might have been deleted, but we still want to show the event
-		logger.WithField("pod", podName).WithError(err).Debug("Could not fetch pod for event, skipping ownership check")
-		return
-	}
-
-	if !k.podBelongsToTargets(ctx, pod) {
-		return
-	}
-
-	// Format and output the event
-	timestamp := event.LastTimestamp.Time.Format("2006-01-02T15:04:05Z")
-	eventType := event.Type
-	reason := event.Reason
-	message := event.Message
-	count := event.Count
-
-	// Map event to log level
-	logLevel := MapEventToLogLevel(event)
-
-	// Log with appropriate level
-	logEntry := logger.WithFields(logrus.Fields{
-		"pod":       podName,
-		"timestamp": timestamp,
-		"type":      eventType,
-		"reason":    reason,
-		"count":     count,
-		"source":    "event",
-	})
-
-	switch logLevel {
-	case Debug:
-		logEntry.Debug(message)
-	case Info:
-		logEntry.Info(message)
-	case Warn:
-		logEntry.Warn(message)
-	case Error:
-		logEntry.Error(message)
-	default:
-		logEntry.Info(message)
-	}
+// PodBelongsToTargets implements eventsPipe.PodOwnershipChecker interface
+func (k *KubeLogStreamer) PodBelongsToTargets(ctx context.Context, pod *corev1.Pod) bool {
+	return k.podBelongsToTargets(ctx, pod)
 }
 
 // traverse ownerReferences up to top-level and check inclusion in k.topLevelUIDs

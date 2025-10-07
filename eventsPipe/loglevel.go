@@ -1,9 +1,8 @@
-package main
+package eventsPipe
 
 import (
-	"regexp"
-
 	v1 "k8s.io/api/core/v1"
+	"regexp"
 )
 
 type LogLevel int
@@ -68,6 +67,7 @@ var reasonExactToLevel = map[string]LogLevel{
 	"ReconcileError":            Warn,
 	"CNIConfigError":            Warn,
 	"CNINotInitialized":         Warn,
+	"Killing":                   Warn,
 
 	// ERROR (требует вмешательства)
 	"FailedCreate":          Error,
