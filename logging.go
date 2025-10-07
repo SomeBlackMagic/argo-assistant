@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -94,8 +93,7 @@ func (ls *LogStreamer) StartLogStream(ctx context.Context, podName, containerNam
 	}
 	defer stream.Close()
 
-	prefix := fmt.Sprintf("[%s] [LOG] ", podName)
-	if err := copyWithPrefix(ctx, ls.out, stream, prefix); err != nil && err != context.Canceled {
+	if err := copyWithLogrus(ctx, stream, podName, containerName); err != nil && err != context.Canceled {
 		logger.WithFields(logrus.Fields{
 			"stream":    streamKey,
 			"pod":       podName,
@@ -135,8 +133,8 @@ func (ls *LogStreamer) waitContainerReady(ctx context.Context, podName, containe
 	}
 }
 
-// copyWithPrefix copies from src to dst, adding prefix to each line
-func copyWithPrefix(ctx context.Context, dst io.Writer, src io.Reader, prefix string) error {
+// copyWithLogrus copies from src to logrus logger, streaming logs line by line
+func copyWithLogrus(ctx context.Context, src io.Reader, podName, containerName string) error {
 	buf := make([]byte, 32*1024)
 	var line []byte
 	for {
@@ -149,10 +147,16 @@ func copyWithPrefix(ctx context.Context, dst io.Writer, src io.Reader, prefix st
 					line = append(line, chunk...)
 					break
 				}
-				line = append(line, chunk[:i+1]...)
-				if _, werr := io.WriteString(dst, prefix+string(line)); werr != nil {
-					return werr
-				}
+				line = append(line, chunk[:i]...)
+
+				// Log through logrus
+				logLine := string(line)
+				logger.WithFields(logrus.Fields{
+					"pod":       podName,
+					"container": containerName,
+					"source":    "pod_log",
+				}).Info(logLine)
+
 				line = line[:0]
 				chunk = chunk[i+1:]
 			}
@@ -160,7 +164,12 @@ func copyWithPrefix(ctx context.Context, dst io.Writer, src io.Reader, prefix st
 		if err != nil {
 			if err == io.EOF {
 				if len(line) > 0 {
-					_, _ = io.WriteString(dst, prefix+string(line))
+					logLine := string(line)
+					logger.WithFields(logrus.Fields{
+						"pod":       podName,
+						"container": containerName,
+						"source":    "pod_log",
+					}).Info(logLine)
 				}
 				return nil
 			}
@@ -177,22 +186,4 @@ func indexByte(b []byte, c byte) int {
 		}
 	}
 	return -1
-}
-
-// FormatKubectlCommand formats kubectl command output string
-func FormatKubectlCommand(namespace, podName, containerName string, hasTail bool) string {
-	if hasTail {
-		return fmt.Sprintf("[kubectl] logs --namespace=%s pod/%s -c %s --tail=10 (follow)\n", namespace, podName, containerName)
-	}
-	return fmt.Sprintf("[kubectl] logs --namespace=%s pod/%s -c %s (follow)\n", namespace, podName, containerName)
-}
-
-// FormatLogPrefix formats log line prefix
-func FormatLogPrefix(podName, containerName string) string {
-	return fmt.Sprintf("[%s %s] ", podName, containerName)
-}
-
-// FormatErrorMessage formats error message for log output
-func FormatErrorMessage(podName, containerName string, err error) string {
-	return fmt.Sprintf("[warn] copy logs error pod=%s container=%s: %v\n", podName, containerName, err)
 }

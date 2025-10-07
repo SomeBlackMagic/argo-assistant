@@ -516,8 +516,31 @@ func (k *KubeLogStreamer) onEvent(ctx context.Context, obj interface{}) {
 	message := event.Message
 	count := event.Count
 
-	fmt.Fprintf(k.Out, "[%s] [EVENT] %s | Type: %s | Reason: %s | Count: %d | %s\n",
-		podName, timestamp, eventType, reason, count, message)
+	// Map event to log level
+	logLevel := MapEventToLogLevel(event)
+
+	// Log with appropriate level
+	logEntry := logger.WithFields(logrus.Fields{
+		"pod":       podName,
+		"timestamp": timestamp,
+		"type":      eventType,
+		"reason":    reason,
+		"count":     count,
+		"source":    "event",
+	})
+
+	switch logLevel {
+	case Debug:
+		logEntry.Debug(message)
+	case Info:
+		logEntry.Info(message)
+	case Warn:
+		logEntry.Warn(message)
+	case Error:
+		logEntry.Error(message)
+	default:
+		logEntry.Info(message)
+	}
 }
 
 // traverse ownerReferences up to top-level and check inclusion in k.topLevelUIDs

@@ -12,7 +12,7 @@ func main() {
 	argocd := getEnvStrict("ARGOCD", "argocd")
 
 	if len(os.Args) < 3 {
-		logger.Errorf("Usage: %s <app-name> <app-namespace>", os.Args[0])
+		logger.WithField("usage", os.Args[0]+" <app-name> <app-namespace>").Error("Invalid arguments")
 		os.Exit(1)
 	}
 	appName := os.Args[1]
@@ -61,7 +61,7 @@ func getEnvStrict(name, defaultVal string) string {
 		if defaultVal != "" {
 			return defaultVal
 		}
-		logger.Errorf("Required environment variable %s is not set", name)
+		logger.WithField("variable", name).Error("Required environment variable is not set")
 		os.Exit(1)
 	}
 	return v
