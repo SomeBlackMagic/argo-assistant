@@ -83,7 +83,7 @@ jobs:
       - name: Check release exists by tag
         if: github.ref_type == 'tag'
         id: rel
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const tag = process.env.GITHUB_REF_NAME;
