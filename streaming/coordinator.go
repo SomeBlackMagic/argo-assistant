@@ -2,8 +2,8 @@
 package streaming
 
 import (
-	"argocd-watcher/logsPipe"
 	"context"
+	"github.com/SomeBlackMagic/argo-assistant/logsPipe"
 	"sync"
 
 	"github.com/sirupsen/logrus"

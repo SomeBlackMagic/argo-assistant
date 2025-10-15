@@ -2,10 +2,10 @@
 package pod
 
 import (
-	"argocd-watcher/streaming"
-	"argocd-watcher/workloadFinder"
 	"context"
 	"fmt"
+	"github.com/SomeBlackMagic/argo-assistant/streaming"
+	"github.com/SomeBlackMagic/argo-assistant/workloadFinder"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -18,10 +18,10 @@ type OwnershipChecker interface {
 
 // Handler handles pod events and coordinates log streaming
 type Handler struct {
-	namespace          string
-	workloadFinder     *workloadFinder.WorkloadFinder
-	streamCoordinator  *streaming.Coordinator
-	logger             *logrus.Logger
+	namespace         string
+	workloadFinder    *workloadFinder.WorkloadFinder
+	streamCoordinator *streaming.Coordinator
+	logger            *logrus.Logger
 }
 
 // NewHandler creates a new pod handler

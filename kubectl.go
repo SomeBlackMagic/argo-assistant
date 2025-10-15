@@ -2,19 +2,20 @@
 package main
 
 import (
-	"argocd-watcher/client"
-	"argocd-watcher/eventsPipe"
-	"argocd-watcher/informer"
-	"argocd-watcher/logsPipe"
-	"argocd-watcher/pod"
-	"argocd-watcher/scanner"
-	"argocd-watcher/streaming"
-	"argocd-watcher/workloadFinder"
-	"argocd-watcher/workloads"
 	"context"
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/SomeBlackMagic/argo-assistant/client"
+	"github.com/SomeBlackMagic/argo-assistant/eventsPipe"
+	"github.com/SomeBlackMagic/argo-assistant/informer"
+	"github.com/SomeBlackMagic/argo-assistant/logsPipe"
+	"github.com/SomeBlackMagic/argo-assistant/pod"
+	"github.com/SomeBlackMagic/argo-assistant/scanner"
+	"github.com/SomeBlackMagic/argo-assistant/streaming"
+	"github.com/SomeBlackMagic/argo-assistant/workloadFinder"
+	"github.com/SomeBlackMagic/argo-assistant/workloads"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"

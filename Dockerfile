@@ -10,16 +10,20 @@ ARG REVISION
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -o argo-assistant \
+RUN CGO_ENABLED=0 go build \
+  -v \
+  -o argo-assistant \
   -trimpath \
   -mod=readonly \
   -buildvcs=false \
   -tags netgo,osusergo \
   -ldflags "-s -w -buildid= -extldflags '-static' \
-            -X 'main.version=${VERSION}' \
-            -X 'main.revision=${REVISION}'" \
+            -X 'main.version=$VERSION' \
+            -X 'main.revision=$REVISION'" \
     .
 
 FROM scratch
 
 COPY --from=build --chmod=777 /workspace/argo-assistant /usr/local/bin/argo-assistant
+
+ENTRYPOINT ["/usr/local/bin/argo-assistant"]

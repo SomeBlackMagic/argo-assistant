@@ -2,11 +2,11 @@
 package scanner
 
 import (
-	"argocd-watcher/informer"
-	"argocd-watcher/workloadFinder"
-	"argocd-watcher/workloads"
 	"context"
 	"fmt"
+	"github.com/SomeBlackMagic/argo-assistant/informer"
+	"github.com/SomeBlackMagic/argo-assistant/workloadFinder"
+	"github.com/SomeBlackMagic/argo-assistant/workloads"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
