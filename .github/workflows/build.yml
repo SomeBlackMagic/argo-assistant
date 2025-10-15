@@ -63,3 +63,17 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             COMMIT_HASH=${{ github.sha }}
+
+      - name: Extract file from pushed image by digest
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.docker_build.outputs.digest }}"
+          docker pull "$IMAGE"
+          CID=$(docker create "$IMAGE")
+          docker cp "$CID:/usr/local/bin/argo-assistant" ./argo-assistant
+          docker rm "$CID"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: argo-assistant-amd-x64-linux
+          path: argo-assistant
