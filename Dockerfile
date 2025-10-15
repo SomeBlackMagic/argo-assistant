@@ -4,6 +4,10 @@ WORKDIR /workspace
 COPY go.mod .
 COPY go.sum .
 RUN go mod download
+
+ARG VERSION
+ARG REVISION
+
 COPY . .
 
 RUN CGO_ENABLED=0 go build -o argo-assistant \
