@@ -65,6 +65,7 @@ jobs:
             COMMIT_HASH=${{ github.sha }}
 
       - name: Extract file from pushed image
+        if: github.ref_type == 'tag'
         env:
           REGISTRY: ghcr.io
           DIGEST: ${{ steps.docker_build.outputs.digest }}
