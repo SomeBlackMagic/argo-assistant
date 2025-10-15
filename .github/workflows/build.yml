@@ -72,7 +72,7 @@ jobs:
           REPO_LC="${GITHUB_REPOSITORY,,}"
           IMAGE="${REGISTRY}/${REPO_LC}@${DIGEST}"
           docker pull "$IMAGE"
-          CID=$(docker create "$IMAGE")
+          CID=$(docker create "$IMAGE" -c true)
           docker cp "$CID:/usr/local/bin/argo-assistant" ./argo-assistant
           docker rm "$CID"
 
