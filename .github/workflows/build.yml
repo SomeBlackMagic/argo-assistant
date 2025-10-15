@@ -75,9 +75,18 @@ jobs:
           CID=$(docker create "$IMAGE" -c true)
           docker cp "$CID:/usr/local/bin/argo-assistant" ./argo-assistant
           docker rm "$CID"
+          mv argo-assistant argo-assistant-amd-x64-linux
+          sha256sum argo-assistant-amd-x64-linux > argo-assistant.sha256
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: argo-assistant-amd-x64-linux
-          path: argo-assistant
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          files: |
+            argo-assistant-amd-x64-linux
+            argo-assistant.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
