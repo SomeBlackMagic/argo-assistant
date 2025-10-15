@@ -8,15 +8,43 @@ import (
 	"syscall"
 )
 
-func main() {
-	argocd := getEnvStrict("ARGOCD", "argocd")
+var version string = ""
+var revision string = "000000000000000000000000000000"
 
-	if len(os.Args) < 3 {
-		logger.WithField("usage", os.Args[0]+" <app-namespace> <app-name>").Error("Invalid arguments")
+func main() {
+	if len(os.Args) < 2 {
+		logger.WithField("usage", os.Args[0]+" <command> [args]").Error("Invalid arguments")
 		os.Exit(1)
 	}
-	namespace := os.Args[1]
-	appName := os.Args[2]
+
+	command := os.Args[1]
+
+	switch command {
+	case "version":
+		if version == "" {
+			version = "dev"
+		}
+		logger.WithFields(map[string]interface{}{
+			"version":  version,
+			"revision": revision,
+		}).Info("argo-assistant version")
+		os.Exit(0)
+	case "sync":
+		if len(os.Args) < 4 {
+			logger.WithField("usage", os.Args[0]+" sync <app-namespace> <app-name>").Error("Invalid arguments")
+			os.Exit(1)
+		}
+		namespace := os.Args[2]
+		appName := os.Args[3]
+		runSync(namespace, appName)
+	default:
+		logger.WithField("command", command).Error("Unknown command")
+		os.Exit(1)
+	}
+}
+
+func runSync(namespace, appName string) {
+	argocd := getEnvStrict("ARGOCD", "argocd")
 
 	logger.WithFields(map[string]interface{}{
 		"app":       appName,

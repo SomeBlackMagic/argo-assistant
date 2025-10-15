@@ -5,7 +5,16 @@ COPY go.mod .
 COPY go.sum .
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o argo-assistant -ldflags '-w -extldflags "-static"' .
+
+RUN CGO_ENABLED=0 go build -o argo-assistant \
+  -trimpath \
+  -mod=readonly \
+  -buildvcs=false \
+  -tags netgo,osusergo \
+  -ldflags "-s -w -buildid= -extldflags '-static' \
+            -X 'main.version=${VERSION}' \
+            -X 'main.revision=${REVISION}'" \
+    .
 
 FROM scratch
 

@@ -104,7 +104,7 @@ Provides workload-specific logic for each type:
 ## Usage
 
 ```bash
-./argo-assistant <app-name> <app-namespace>
+./argo-assistant sync <app-name> <app-namespace>
 ```
 
 ### Parameters
