@@ -64,9 +64,13 @@ jobs:
           build-args: |
             COMMIT_HASH=${{ github.sha }}
 
-      - name: Extract file from pushed image by digest
+      - name: Extract file from pushed image
+        env:
+          REGISTRY: ghcr.io
+          DIGEST: ${{ steps.docker_build.outputs.digest }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.docker_build.outputs.digest }}"
+          REPO_LC="${GITHUB_REPOSITORY,,}"
+          IMAGE="${REGISTRY}/${REPO_LC}@${DIGEST}"
           docker pull "$IMAGE"
           CID=$(docker create "$IMAGE")
           docker cp "$CID:/usr/local/bin/argo-assistant" ./argo-assistant
