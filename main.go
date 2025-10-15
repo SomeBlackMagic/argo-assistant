@@ -12,11 +12,11 @@ func main() {
 	argocd := getEnvStrict("ARGOCD", "argocd")
 
 	if len(os.Args) < 3 {
-		logger.WithField("usage", os.Args[0]+" <app-name> <app-namespace>").Error("Invalid arguments")
+		logger.WithField("usage", os.Args[0]+" <app-namespace> <app-name>").Error("Invalid arguments")
 		os.Exit(1)
 	}
-	appName := os.Args[1]
-	namespace := os.Args[2]
+	namespace := os.Args[1]
+	appName := os.Args[2]
 
 	logger.WithFields(map[string]interface{}{
 		"app":       appName,
